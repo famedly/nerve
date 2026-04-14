@@ -1,1 +1,1420 @@
-fn main() {}
+mod auth;
+mod image;
+mod registration;
+mod telemetry;
+
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use clap::Parser;
+use matrix_sdk::{
+    Client, Room, ServerName,
+    attachment::{AttachmentConfig, AttachmentInfo, BaseImageInfo},
+    config::SyncSettings,
+    deserialized_responses::TimelineEventKind,
+    encryption::{EncryptionSettings, recovery::RecoveryState},
+    media::{MediaFormat, MediaRequestParameters},
+    room::MessagesOptions,
+    ruma::{
+        OwnedRoomId, OwnedUserId, UInt, UserId,
+        api::client::keys::get_keys,
+        events::{
+            AnySyncMessageLikeEvent, AnySyncTimelineEvent,
+            room::{
+                member::StrippedRoomMemberEvent,
+                message::{
+                    MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+                    TextMessageEventContent,
+                },
+            },
+        },
+        uint,
+    },
+};
+use rand::{Rng, random};
+use tokio::{signal, sync::Mutex as TokioMutex, sync::watch, time::sleep};
+
+/// Classifies the relationship between the local user and the sender of a
+/// received message, used as a structured field on delivery-time log lines.
+#[derive(Debug, Clone, Copy)]
+enum Distance {
+    /// The sender is the same account (echo of our own message).
+    SameUser,
+    /// A different user whose MXID shares the same homeserver.
+    SameServer,
+    /// A user on a different homeserver (federation).
+    Federated,
+}
+
+impl Distance {
+    /// Derive the distance from two MXIDs (`@user:server`).
+    fn from_mxids(our_user_id: &str, sender_user_id: &str) -> Self {
+        if our_user_id == sender_user_id {
+            return Self::SameUser;
+        }
+        let our_server = our_user_id.rsplit_once(':').map(|(_, s)| s);
+        let their_server = sender_user_id.rsplit_once(':').map(|(_, s)| s);
+        if our_server.is_some() && our_server == their_server {
+            Self::SameServer
+        } else {
+            Self::Federated
+        }
+    }
+}
+
+impl fmt::Display for Distance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SameUser => write!(f, "same_user"),
+            Self::SameServer => write!(f, "same_server"),
+            Self::Federated => write!(f, "federated"),
+        }
+    }
+}
+
+/// Shared map tracking the highest serial seen per (room_id, user_id) from
+/// live sync events.  The event handler writes to it; the main loop reads
+/// from it to keep `next_serial` up to date.
+type LiveSerials = Arc<TokioMutex<HashMap<(OwnedRoomId, OwnedUserId), u64>>>;
+
+// ── Parsed user specification ───────────────────────────────────────────
+
+/// A single entry from the `USERS` environment variable.
+///
+/// Format: `@user:server,@peer1:server,@peer2:server`
+///
+/// The first MXID is the user to log in as; the remaining (comma-separated)
+/// MXIDs are its peers.
+#[derive(Debug, Clone)]
+struct UserSpec {
+    mxid: OwnedUserId,
+    /// Homeserver URL derived from the server part of the MXID
+    /// (always `https://<server>`).
+    homeserver_url: String,
+    /// The `localpart` of the MXID (everything between `@` and `:`).
+    username: String,
+    /// Peers this user should create DMs with.
+    peers: Vec<OwnedUserId>,
+}
+
+/// Parse the `USERS` environment variable.
+///
+/// `USERS` is a **whitespace-separated** list of entries.  Each entry is a
+/// **comma-separated** list of MXIDs where the first one is the user and the
+/// rest are its peers.
+///
+/// Example:
+/// ```text
+/// USERS="@alice:hs1.example.com,@bob:hs2.example.net @carol:hs1.example.com"
+/// ```
+impl FromStr for UserSpec {
+    type Err = String;
+    fn from_str(entry: &str) -> Result<UserSpec, String> {
+        let mut mxids = entry.split(',').map(str::trim).filter(|s| !s.is_empty());
+        let mxid_str = mxids.next().ok_or("Empty entry in USERS")?;
+
+        let mxid: OwnedUserId = <&UserId>::try_from(mxid_str)
+            .map_err(|e| format!("Invalid MXID in USERS: {mxid_str:?}: {e}"))?
+            .to_owned();
+
+        // Derive homeserver URL and username from the MXID.
+        let server_name = mxid.server_name().as_str().to_owned();
+        let homeserver_url = format!("https://{server_name}");
+        let username = mxid.localpart().to_owned();
+
+        let peers: Vec<OwnedUserId> = mxids
+            .map(|s| {
+                <&UserId>::try_from(s)
+                    .map_err(|e| {
+                        format!("Invalid peer MXID in USERS entry for {mxid_str}: {s:?}: {e}")
+                    })
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<Result<_, String>>()?;
+
+        Ok(UserSpec {
+            mxid,
+            homeserver_url,
+            username,
+            peers,
+        })
+    }
+}
+
+// ── Interval range ──────────────────────────────────────────────────────
+
+/// A closed `[lo, hi]` range of seconds.  Each call to [`sample`] picks a
+/// value uniformly at random from the range and returns it as a [`Duration`].
+///
+/// Parsed from strings of the form `"10..20"` (range) or `"10"` (point).
+#[derive(Debug, Clone, Copy)]
+struct IntervalRange {
+    lo: u64,
+    hi: u64,
+}
+
+impl FromStr for IntervalRange {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some((a, b)) = s.split_once("..") {
+            let lo = a
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| format!("bad lower bound: {e}"))?;
+            let hi = b
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| format!("bad upper bound: {e}"))?;
+            Ok(Self {
+                lo: lo.min(hi),
+                hi: lo.max(hi),
+            })
+        } else {
+            let v = s
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| format!("bad interval value: {e}"))?;
+            Ok(Self { lo: v, hi: v })
+        }
+    }
+}
+
+impl IntervalRange {
+    /// Return a random [`Duration`] sampled uniformly from `[lo, hi]`.
+    fn sample(self) -> Duration {
+        if self.lo == self.hi {
+            Duration::from_secs(self.lo)
+        } else {
+            let secs = rand::rng().random_range(self.lo..=self.hi);
+            Duration::from_secs(secs)
+        }
+    }
+}
+
+// ── Invite domain patterns ──────────────────────────────────────────────
+
+/// A pattern that matches the server-name part of a room ID to decide
+/// whether to auto-accept an invite.
+///
+/// Parsed from individual entries in the `ACCEPT_INVITE_DOMAINS` env var:
+///
+/// | Syntax | Meaning |
+/// |---|---|
+/// | `example.com` | Exact match only |
+/// | `.example.com` | One or more sub-domain levels (matches `a.example.com`, `a.b.example.com`, but **not** `example.com` itself) |
+/// | `*.example.com` | Exactly one sub-domain level (matches `a.example.com` but **not** `a.b.example.com` or `example.com`) |
+#[derive(Debug, Clone)]
+enum InviteDomainPattern {
+    /// Exact match: the server name must equal `domain`.
+    Exact(String),
+    /// One-or-more subdomain levels: the server name must end with
+    /// `.<domain>` (the leading dot is stored in `suffix`).
+    DotSubdomain(String),
+    /// Single-level wildcard (`*.domain`): there must be exactly one label
+    /// before `.<domain>`.
+    WildcardSubdomain(String),
+}
+
+impl From<&ServerName> for InviteDomainPattern {
+    fn from(value: &ServerName) -> Self {
+        Self::Exact(value.to_string())
+    }
+}
+
+impl FromStr for InviteDomainPattern {
+    type Err = String;
+    /// Parse a single pattern string.
+    fn from_str(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(String::new());
+        }
+        if let Some(rest) = s.strip_prefix("*.") {
+            if rest.is_empty() {
+                return Err(String::new());
+            }
+            // Store as ".<domain>" so matching is a simple suffix check
+            // after verifying there is exactly one label before it.
+            Ok(Self::WildcardSubdomain(format!(".{rest}")))
+        } else if let Some(rest) = s.strip_prefix('.') {
+            if rest.is_empty() {
+                return Err(String::new());
+            }
+            // Store as ".<domain>" — any server name ending with this suffix
+            // matches (one or more sub-domain levels).
+            Ok(Self::DotSubdomain(format!(".{rest}")))
+        } else {
+            Ok(Self::Exact(s.to_owned()))
+        }
+    }
+}
+
+impl InviteDomainPattern {
+    /// Test whether `server_name` matches this pattern.
+    fn matches(&self, server_name: &str) -> bool {
+        match self {
+            Self::Exact(domain) => server_name == domain,
+            Self::DotSubdomain(suffix) => server_name.ends_with(suffix),
+            Self::WildcardSubdomain(suffix) => {
+                // `suffix` is ".<domain>".  The server name must end with it
+                // and the prefix (the part before it) must be a single DNS
+                // label, i.e. non-empty and containing no dots.
+                if let Some(prefix) = server_name.strip_suffix(suffix.as_str()) {
+                    !prefix.is_empty() && !prefix.contains('.')
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// Check whether `server_name` matches any of the given patterns.
+fn matches_invite_domain(patterns: &[InviteDomainPattern], server_name: &str) -> bool {
+    patterns.iter().any(|p| p.matches(server_name))
+}
+
+// ── Configuration ───────────────────────────────────────────────────────
+
+/// Complete application configuration, parsed from environment variables.
+#[derive(Parser, Clone)]
+#[command(about = "Cloud-native Matrix test client")]
+struct Config {
+    /// Space-separated list of user entries.  Each entry is a
+    /// comma-separated list of MXIDs: the first is the user, the rest are
+    /// its peers.
+    #[arg(env = "USERS", value_delimiter = ' ', required = true)]
+    users: Vec<UserSpec>,
+
+    /// When set, print derived passwords/passphrases for all users and exit.
+    #[arg(long, default_value_t = false)]
+    print: bool,
+
+    // ── Authentication ─────────────────────────────────────────────────
+    #[command(flatten)]
+    auth: auth::AuthConfig,
+
+    // ── Operational tuning ──────────────────────────────────────────────
+    /// Leave a room when message verification fails.
+    #[arg(long, env = "LEAVE_ON_FAILURE", default_value_t = false)]
+    leave_on_failure: bool,
+
+    /// Probability (0.0–1.0) of sending a PNG image instead of text.
+    #[arg(long, env = "MEDIA_PROBABILITY", default_value_t = 0.0)]
+    media_probability: f64,
+
+    /// Seconds between successive user logins.  Single value or range
+    /// (`5..15`).
+    #[arg(long, env = "LOGIN_INTERVAL", default_value = "10")]
+    login_interval: IntervalRange,
+
+    /// Timeout in seconds for each `/sync` request.
+    #[arg(long, env = "SYNC_TIMEOUT", default_value_t = 10)]
+    sync_timeout: u64,
+
+    /// Seconds to wait before retrying after a sync error.  Single value or
+    /// range.
+    #[arg(long, env = "SYNC_ERROR_DELAY", default_value = "2")]
+    sync_error_delay: IntervalRange,
+
+    /// Seconds between main-loop ticks.  Single value or range.
+    #[arg(long, env = "LOOP_INTERVAL", default_value = "2")]
+    loop_interval: IntervalRange,
+
+    /// Number of main-loop cycles to wait before promoting to sender after
+    /// becoming the first device.
+    #[arg(long, env = "PROMOTION_WAIT_CYCLES", default_value_t = 1)]
+    promotion_wait_cycles: u64,
+
+    /// Comma-separated domain patterns for auto-accepting room invites.
+    #[arg(long, env = "ACCEPT_INVITE_DOMAINS", value_delimiter = ',')]
+    accept_invite_domains: Vec<InviteDomainPattern>,
+}
+
+// ── Small helpers ───────────────────────────────────────────────────────
+
+/// Check whether our device is the "first" for the account.
+/// Only the first device should send messages to avoid duplicates when
+/// multiple clients are logged in.
+async fn is_first_device(client: &Client) -> bool {
+    let Ok(response) = client.devices().await else {
+        return false;
+    };
+
+    let first_dev = response
+        .devices
+        .iter()
+        .min_by_key(|d| (&d.display_name, &d.device_id));
+
+    client
+        .device_id()
+        .is_some_and(|id| first_dev.is_some_and(|dev| dev.device_id == id))
+}
+
+/// Current UNIX timestamp in milliseconds.
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// Try to parse a message body of the form "Message #<serial> <timestamp_ms>".
+/// Returns `(serial, timestamp_ms)` on success.
+fn parse_message_body(body: &str) -> Option<(u64, u64)> {
+    let rest = body.strip_prefix("Message #")?;
+    let mut parts = rest.splitn(2, ' ');
+    let serial = parts.next()?.parse::<u64>().ok()?;
+    let ts = parts.next()?.parse::<u64>().ok()?;
+    Some((serial, ts))
+}
+
+/// Wait for either SIGINT or SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            signal::unix::signal(signal::unix::SignalKind::terminate()).expect("register SIGTERM");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+    }
+}
+/// Per-room verification / pagination state.
+struct RoomVerificationState {
+    /// The Matrix room handle.
+    room: Room,
+    /// Pagination token for reading backwards.  `None` means start from the
+    /// most recent event; `Some(token)` continues from where we left off.
+    /// Once the server returns no `end` token the room is fully verified.
+    pagination_token: Option<String>,
+    /// Whether we have started paginating (so `pagination_token` being `None`
+    /// at the start means "begin from the end", not "fully done").
+    started: bool,
+    /// Whether we have finished paginating all the way to the beginning.
+    fully_verified: bool,
+    /// Whether verification detected an invalid message.  Once set, the room
+    /// is no longer eligible for sending or further verification.
+    failed: bool,
+    /// Last-known serial for each sender, used to verify monotonically
+    /// decreasing serials as we paginate backwards.
+    last_serial_by_user: HashMap<OwnedUserId, u64>,
+    /// Once we know our own last serial, the room is eligible for sending.
+    /// This stores the *next* serial to send.
+    next_serial: Option<u64>,
+}
+
+impl RoomVerificationState {
+    fn new(room: Room) -> Self {
+        Self {
+            room,
+            pagination_token: None,
+            started: false,
+            fully_verified: false,
+            failed: false,
+            last_serial_by_user: HashMap::new(),
+            next_serial: None,
+        }
+    }
+
+    /// Run one verification step: read one page of events backwards and
+    /// validate serials.  Returns `(events_processed, verification_failed)`.
+    /// If `verification_failed` is true, the room should be left.
+    async fn verify_page(
+        &mut self,
+        our_user_id: &OwnedUserId,
+        client: &Client,
+    ) -> anyhow::Result<(usize, bool)> {
+        if self.fully_verified {
+            return Ok((0, false));
+        }
+
+        let mut options = MessagesOptions::backward();
+        options.limit = uint!(20);
+        if let Some(ref token) = self.pagination_token {
+            options = options.from(token.as_str());
+        }
+
+        let messages = self.room.messages(options).await?;
+        let count = messages.chunk.len();
+        let mut failed = false;
+
+        for event in &messages.chunk {
+            // Undecryptable events are tolerated – assume they contained a
+            // valid serial and adjust tracking accordingly.
+            if matches!(&event.kind, TimelineEventKind::UnableToDecrypt { .. }) {
+                if let Ok(AnySyncTimelineEvent::MessageLike(
+                    AnySyncMessageLikeEvent::RoomEncrypted(enc),
+                )) = event.raw().deserialize()
+                {
+                    let sender: OwnedUserId = enc.sender().to_owned();
+                    let entry = self.last_serial_by_user.entry(sender.clone()).or_insert(0);
+                    if *entry > 0 {
+                        *entry -= 1;
+                    }
+                    if &sender == our_user_id && self.next_serial.is_none() && *entry > 0 {
+                        self.next_serial = Some(*entry + 1);
+                    }
+                }
+                continue;
+            }
+
+            let deserialized = event.raw().deserialize();
+
+            // State events are tolerated (e.g. room creation, encryption,
+            // membership changes).
+            if matches!(&deserialized, Ok(AnySyncTimelineEvent::State(_))) {
+                continue;
+            }
+
+            // Everything else must be a RoomMessage with a valid "Message #N"
+            // text body (or image with that caption).  Any deviation fails
+            // verification.
+            let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(msg))) =
+                deserialized
+            else {
+                log::error!(
+                    "  ⚠ [{}] Unexpected event type (not a room message)",
+                    self.room.room_id(),
+                );
+                failed = true;
+                continue;
+            };
+
+            let Some(original) = msg.as_original() else {
+                log::error!("  ⚠ [{}] Redacted room message", self.room.room_id(),);
+                failed = true;
+                continue;
+            };
+
+            // Extract the body from text messages or the caption from image
+            // messages.  For images we also validate the media data.
+            let body: &str;
+            match &original.content.msgtype {
+                MessageType::Text(text) => {
+                    body = &text.body;
+                }
+                MessageType::Image(img) => {
+                    let Some(caption) = img.caption() else {
+                        log::error!(
+                            "  ⚠ [{}] Image without caption from {}",
+                            self.room.room_id(),
+                            original.sender,
+                        );
+                        failed = true;
+                        continue;
+                    };
+                    body = caption;
+
+                    // Download and validate the image data.
+                    let request = MediaRequestParameters {
+                        source: img.source.clone(),
+                        format: MediaFormat::File,
+                    };
+                    match client.media().get_media_content(&request, true).await {
+                        Ok(data) => {
+                            if let Err(e) = image::validate_png(&data) {
+                                log::error!(
+                                    "  ⚠ [{}] Invalid PNG from {}: {e}",
+                                    self.room.room_id(),
+                                    original.sender,
+                                );
+                                failed = true;
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "  ⚠ [{}] Failed to download media from {}: {e}",
+                                self.room.room_id(),
+                                original.sender,
+                            );
+                            failed = true;
+                            continue;
+                        }
+                    }
+                }
+                _ => {
+                    log::error!(
+                        "  ⚠ [{}] Unsupported message type from {}",
+                        self.room.room_id(),
+                        original.sender,
+                    );
+                    failed = true;
+                    continue;
+                }
+            };
+
+            let Some((n, _ts)) = parse_message_body(body) else {
+                log::error!(
+                    "  ⚠ [{}] Bad message format from {}: {:?}",
+                    self.room.room_id(),
+                    original.sender,
+                    body,
+                );
+                failed = true;
+                continue;
+            };
+
+            let sender = original.sender.clone();
+
+            if let Some(expected) = self.last_serial_by_user.get(&sender) {
+                // Reading backwards: serials should decrease by 1.
+                if *expected > 0 && n != expected - 1 {
+                    log::error!(
+                        "  ⚠ [{}] Serial mismatch for {sender}: expected #{}, got #{n}",
+                        self.room.room_id(),
+                        expected - 1,
+                    );
+                    failed = true;
+                }
+            }
+
+            self.last_serial_by_user.insert(sender.clone(), n);
+
+            // First (most recent) message from us determines next_serial.
+            if &sender == our_user_id && self.next_serial.is_none() {
+                self.next_serial = Some(n + 1);
+                log::info!(
+                    "  🔍 [{}] Found our last serial #{n} → next #{}",
+                    self.room.room_id(),
+                    n + 1,
+                );
+            }
+        }
+
+        // Update pagination state.
+        self.started = true;
+        match messages.end {
+            Some(token) if count > 0 => {
+                self.pagination_token = Some(token);
+            }
+            _ => {
+                // No more pages.
+                self.fully_verified = true;
+                // If we never found a message from ourselves, start at #1.
+                if self.next_serial.is_none() {
+                    self.next_serial = Some(1);
+                    log::info!(
+                        "  🔍 [{}] Verification complete (no messages from us, starting at #1)",
+                        self.room.room_id()
+                    );
+                } else {
+                    log::info!(
+                        "  🔍 [{}] Verification complete (reached beginning)",
+                        self.room.room_id()
+                    );
+                }
+            }
+        }
+
+        Ok((count, failed))
+    }
+
+    /// Whether this room is eligible for sending (we know our serial and
+    /// verification has not failed).
+    fn is_send_eligible(&self) -> bool {
+        !self.failed && self.next_serial.is_some()
+    }
+
+    /// Whether this room still needs verification steps.
+    fn needs_verification(&self) -> bool {
+        !self.failed && !self.fully_verified
+    }
+}
+
+// ── Entry point ─────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let _telemetry_guard = telemetry::init_telemetry();
+
+    // ── Parse configuration from env / CLI ──────────────────────────────
+    let mut config = Config::parse();
+
+    // ── PRINT mode ──────────────────────────────────────────────────────
+    if config.print {
+        for u in &config.users {
+            let mxid = u.mxid.as_str();
+            let account_password = config
+                .auth
+                .account_password(mxid)
+                .or_else(|| {
+                    config
+                        .auth
+                        .resolve_sta_secret(u.mxid.server_name().as_str())
+                })
+                .unwrap_or_default();
+            let recovery_passphrase = config.auth.recovery_passphrase(mxid);
+            let peers_str: Vec<&str> = u.peers.iter().map(|p| p.as_str()).collect();
+            println!(
+                "{mxid} {account_password} {recovery_passphrase} peers=[{}]",
+                peers_str.join(",")
+            );
+        }
+        return Ok(());
+    }
+
+    let local_servers: HashSet<_> = config
+        .users
+        .iter()
+        .flat_map(|user| {
+            user.peers
+                .iter()
+                .chain(Some(&user.mxid))
+                .map(|mxid| mxid.server_name())
+        })
+        .collect();
+    config
+        .accept_invite_domains
+        .extend(local_servers.into_iter().map(Into::into));
+
+    // ── Shutdown signal ─────────────────────────────────────────────────
+    let (stop_tx, stop_rx) = watch::channel(false);
+    {
+        let stop_tx_signal = stop_tx.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            log::info!("⚡ Received shutdown signal");
+            let _ = stop_tx_signal.send(true);
+        });
+    }
+
+    // ── Spawn one task per user (staggered) ─────────────────────────────
+    let mut handles = Vec::with_capacity(config.users.len());
+    let mut stagger = Duration::ZERO;
+    for user in config.users.clone() {
+        let user_stagger = stagger;
+        stagger += config.login_interval.sample();
+        let config = config.clone();
+        let stop_rx = stop_rx.clone();
+        let handle = tokio::spawn(async move {
+            // Wait for the stagger delay, but bail out early on shutdown.
+            if !user_stagger.is_zero() {
+                let mut stop = stop_rx.clone();
+                tokio::select! {
+                    _ = sleep(user_stagger) => {}
+                    _ = stop.changed() => {
+                        log::info!("[{}] Shutdown before login (stagger cancelled)", user.mxid);
+                        return;
+                    }
+                }
+            }
+            let mxid = user.mxid.as_str().to_owned();
+            if let Err(e) = run_user(user, config, stop_rx).await {
+                log::error!("[{mxid}] Fatal error: {e:#}");
+            }
+        });
+        handles.push(handle);
+    }
+
+    // Wait for all user tasks to finish.
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    // Ensure the stop channel is marked so any stragglers notice.
+    let _ = stop_tx.send(true);
+
+    Ok(())
+}
+
+// ── Per-user lifecycle ──────────────────────────────────────────────────
+
+/// Run the full lifecycle for a single user: register, log in, set up E2EE,
+/// verify rooms, send messages, create DMs.  Returns when the shutdown
+/// signal fires or an unrecoverable error occurs.
+async fn run_user(
+    user: UserSpec,
+    config: Config,
+    stop_rx: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let mxid = user.mxid.as_str().to_owned();
+    let homeserver_url = &user.homeserver_url;
+    let username = &user.username;
+    let peers = &user.peers;
+
+    // ── 1 & 2. Register (if applicable) and log in ─────────────────────
+    let client = Client::builder()
+        .homeserver_url(homeserver_url)
+        .with_encryption_settings(EncryptionSettings {
+            auto_enable_cross_signing: true,
+            auto_enable_backups: true,
+            ..Default::default()
+        })
+        .build()
+        .await?;
+
+    let initial_name = format!("{:0>11x}", now_millis());
+    assert_eq!(initial_name.len(), 11);
+
+    let server_name = user.mxid.server_name().as_str();
+    config
+        .auth
+        .login(
+            &client,
+            homeserver_url,
+            server_name,
+            username,
+            &mxid,
+            &initial_name,
+        )
+        .await?;
+
+    let recovery_passphrase = config.auth.recovery_passphrase(&mxid);
+
+    let our_user_id = client
+        .user_id()
+        .expect("logged in, must have user_id")
+        .to_owned();
+
+    log::info!("[{mxid}] ✔ Logged in via matrix-sdk");
+
+    // ── 3. Set up E2EE (cross-signing + recovery / secret storage) ──────
+    log::info!("[{mxid}] ▶ Running initial sync …");
+    client.sync_once(SyncSettings::default()).await?;
+
+    // Accept pending invites from rooms whose server name matches the
+    // configured ACCEPT_INVITE_DOMAINS patterns.
+    {
+        let invited: Vec<_> = client
+            .invited_rooms()
+            .into_iter()
+            .filter(|r| {
+                r.room_id().server_name().is_some_and(|s| {
+                    matches_invite_domain(&config.accept_invite_domains, s.as_str())
+                })
+            })
+            .collect();
+
+        if !invited.is_empty() {
+            log::info!("[{mxid}] ▶ Accepting {} pending invite(s) …", invited.len());
+            for room in invited {
+                match room.join().await {
+                    Ok(()) => log::info!("[{mxid}]   ✔ Joined {}", room.room_id()),
+                    Err(e) => log::error!("[{mxid}]   ✘ Failed to join {}: {e}", room.room_id()),
+                }
+            }
+            client.sync_once(SyncSettings::default()).await?;
+        }
+    }
+
+    // Enable recovery or import existing secrets.
+    let recovery = client.encryption().recovery();
+
+    match recovery.state() {
+        RecoveryState::Enabled | RecoveryState::Incomplete => {
+            log::info!("[{mxid}] ▶ Recovering existing secrets …");
+            recovery.recover(&recovery_passphrase).await?;
+            log::info!("[{mxid}] ✔ Existing recovery secrets imported");
+        }
+        _ => {
+            log::info!("[{mxid}] ▶ Enabling recovery …");
+            let _recovery_key = recovery
+                .enable()
+                .wait_for_backups_to_upload()
+                .with_passphrase(&recovery_passphrase)
+                .await?;
+            log::info!("[{mxid}] ✔ E2EE recovery enabled (passphrase-protected)");
+        }
+    }
+
+    // ── 4. Register event handlers and start background sync ────────────
+
+    let live_serials: LiveSerials = Arc::new(TokioMutex::new(HashMap::new()));
+
+    // Print all incoming room messages with delivery time and track serials.
+    // For media messages the delivery time includes downloading and validating
+    // the image so it reflects true end-to-end latency.
+    let live_serials_handler = live_serials.clone();
+    let our_user_id_handler = our_user_id.clone();
+    client.add_event_handler(
+        move |ev: OriginalSyncRoomMessageEvent, room: Room, client: Client| {
+            let live_serials = live_serials_handler.clone();
+            let our_user_id = our_user_id_handler.clone();
+            async move {
+                let room_name = room.name().unwrap_or_else(|| room.room_id().to_string());
+                // Extract the message body from text or image caption.
+                let (body, is_media) = match &ev.content.msgtype {
+                    MessageType::Text(text) => (Some(text.body.clone()), false),
+                    MessageType::Image(img) => (img.caption().map(|s| s.to_owned()), true),
+                    _ => (None, false),
+                };
+
+                if let Some(body) = body {
+                    if let Some((serial, send_ts)) = parse_message_body(&body) {
+                        // For media, download and validate before taking the
+                        // timestamp so that delivery time covers the full
+                        // receive path.
+                        let (media_ok, media_size_bytes) = if is_media {
+                            if let MessageType::Image(img) = &ev.content.msgtype {
+                                let request = MediaRequestParameters {
+                                    source: img.source.clone(),
+                                    format: MediaFormat::File,
+                                };
+                                match client.media().get_media_content(&request, true).await {
+                                    Ok(data) => {
+                                        let size = data.len() as u64;
+                                        if let Err(e) = image::validate_png(&data) {
+                                            log::error!(
+                                                "  ⚠ [{room_name}] {}: Media #{serial} \
+                                                 invalid PNG: {e}",
+                                                ev.sender,
+                                            );
+                                            (false, Some(size))
+                                        } else {
+                                            (true, Some(size))
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "  ⚠ [{room_name}] {}: Media #{serial} \
+                                             download failed: {e}",
+                                            ev.sender,
+                                        );
+                                        (false, None)
+                                    }
+                                }
+                            } else {
+                                (false, None)
+                            }
+                        } else {
+                            (true, None)
+                        };
+
+                        let delivery_ms = now_millis().saturating_sub(send_ts);
+                        let kind = if is_media { "media" } else { "text" };
+                        let distance =
+                            Distance::from_mxids(our_user_id.as_str(), ev.sender.as_str());
+                        let valid = media_ok;
+                        let ev_sender = &ev.sender;
+                        let suffix = if valid { "" } else { ", INVALID" };
+
+                        tracing::info!(
+                            delivery_ms,
+                            serial,
+                            kind,
+                            distance = %distance,
+                            media_size_bytes = media_size_bytes,
+                            valid,
+                            room = %room.room_id(),
+                            sender = %ev_sender,
+                            user = %our_user_id,
+                            "  📩 [{room_name}] {ev_sender}: {kind} #{serial} \
+                             (delivery: {delivery_ms}ms{suffix})",
+                        );
+
+                        // Update the live serial tracker.
+                        let key = (room.room_id().to_owned(), ev.sender.clone());
+                        let mut map = live_serials.lock().await;
+                        let entry = map.entry(key).or_insert(0);
+                        if serial >= *entry {
+                            *entry = serial;
+                        }
+                    } else {
+                        log::info!("  📩 [{room_name}] {}: {}", ev.sender, body);
+                    }
+                } else {
+                    log::info!("  📩 [{room_name}] {}: (non-text message)", ev.sender);
+                }
+            }
+        },
+    );
+
+    // Auto-accept invites from rooms whose server name matches the
+    // configured ACCEPT_INVITE_DOMAINS patterns.
+    let invite_domains = config.accept_invite_domains;
+    client.add_event_handler(
+        move |ev: StrippedRoomMemberEvent, room: Room, client: Client| {
+            let invite_domains = invite_domains.clone();
+            async move {
+                let our_user_id = client.user_id().map(|u| u.to_string()).unwrap_or_default();
+                if ev.state_key != our_user_id {
+                    return;
+                }
+
+                let room_id = room.room_id().to_owned();
+                if !room_id
+                    .server_name()
+                    .is_some_and(|s| matches_invite_domain(&invite_domains, s.as_str()))
+                {
+                    return;
+                }
+
+                log::info!("  📨 Invited to {room_id} – joining …");
+                match room.join().await {
+                    Ok(()) => log::info!("  ✔ Joined {room_id}"),
+                    Err(e) => log::info!("  ✘ Failed to join {room_id}: {e}"),
+                }
+            }
+        },
+    );
+
+    // Spawn the background sync loop.
+    let sync_client = client.clone();
+    let mut sync_stop_rx = stop_rx.clone();
+    let sync_timeout = config.sync_timeout;
+    let sync_error_delay = config.sync_error_delay;
+    let sync_handle = tokio::spawn(async move {
+        let settings = SyncSettings::default().timeout(Duration::from_secs(sync_timeout));
+
+        loop {
+            let sync = sync_client.sync_once(settings.clone());
+            tokio::select! {
+                _ = sync_stop_rx.changed() => {
+                    break;
+                }
+                result = sync => {
+                    if let Err(e) = result {
+                        log::error!("  ✘ Sync error: {e}");
+                        sleep(sync_error_delay.sample()).await;
+                    }
+                }
+            }
+        }
+    });
+
+    // ── 5. Main loop: alternate between verify, send, and DM creation ───
+    //
+    // We maintain a map of room_id → RoomVerificationState.  Each tick (2s)
+    // we perform one of three actions in round-robin:
+    //   (a) run a verification step on a room that still needs it,
+    //   (b) send a message to a send-eligible room,
+    //   (c) create a DM with a peer that doesn't have one yet.
+
+    let mut rooms: HashMap<OwnedRoomId, RoomVerificationState> = HashMap::new();
+
+    // Indices for round-robin.
+    let mut verify_rr: usize = 0;
+    let mut send_rr: usize = 0;
+    let mut dm_rr: usize = 0;
+    // Cycles through 0 = verify, 1 = send, 2 = dm_create, to give each
+    // action type a fair share of steps.
+    let mut action_cycle: usize = 0;
+
+    // Track whether we are the primary (first) device for this account.
+    // When we first become the first device we wait `promotion_wait_cycles`
+    // main-loop ticks before actually sending, so that other devices have a
+    // chance to appear.
+    let mut we_are_first = is_first_device(&client).await;
+    let mut promotion_counter: u64 = 0;
+    let mut promoted = false;
+    if we_are_first {
+        log::info!(
+            "[{mxid}] ✔ We are the first device – waiting {wait} cycle(s) before sending",
+            wait = config.promotion_wait_cycles
+        );
+    } else {
+        log::info!("[{mxid}] ℹ Another device is primary – will only verify, not send");
+    }
+
+    let mut main_stop_rx = stop_rx.clone();
+
+    log::info!("[{mxid}] ▶ Starting verify/send loop (Ctrl-C to stop) …");
+
+    loop {
+        if *main_stop_rx.borrow() {
+            break;
+        }
+
+        // Update next_serial in each room from live sync data so that
+        // when we become the first device, we pick up where others left off.
+        {
+            let map = live_serials.lock().await;
+            for (state_room_id, state) in rooms.iter_mut() {
+                let key = (state_room_id.clone(), our_user_id.clone());
+                if let Some(&live_serial) = map.get(&key) {
+                    let candidate = live_serial + 1;
+                    match state.next_serial {
+                        Some(current) if candidate > current => {
+                            state.next_serial = Some(candidate);
+                        }
+                        None => {
+                            state.next_serial = Some(candidate);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Remove rooms we are no longer a member of.
+        let joined_ids: std::collections::HashSet<OwnedRoomId> = client
+            .joined_rooms()
+            .iter()
+            .map(|r| r.room_id().to_owned())
+            .collect();
+        rooms.retain(|rid, _| {
+            if joined_ids.contains(rid) {
+                true
+            } else {
+                log::info!("[{mxid}]   🚪 Room {rid} is no longer joined, removing from tracking");
+                false
+            }
+        });
+
+        // Re-check first-device status (handles other devices logging out).
+        let was_first = we_are_first;
+        we_are_first = is_first_device(&client).await;
+        if we_are_first && !was_first {
+            // Just became the first device – start the promotion countdown.
+            promotion_counter = 0;
+            promoted = false;
+            log::info!(
+                "[{mxid}]   🔼 We are now the first device – waiting {wait} cycle(s) before sending",
+                wait = config.promotion_wait_cycles
+            );
+        } else if !we_are_first && was_first {
+            promoted = false;
+            promotion_counter = 0;
+            log::info!("[{mxid}]   🔽 Another device took over – will stop sending");
+        }
+
+        // Advance the promotion counter while we are the first device but
+        // not yet promoted.
+        if we_are_first && !promoted {
+            promotion_counter += 1;
+            if promotion_counter > config.promotion_wait_cycles {
+                promoted = true;
+                log::info!("[{mxid}]   🔼 Promotion wait complete – will start sending");
+            }
+        }
+
+        // Discover newly joined rooms and add them to the tracking map.
+        for joined in client.joined_rooms() {
+            let rid = joined.room_id();
+            if let std::collections::hash_map::Entry::Vacant(entry) = rooms.entry(rid.to_owned()) {
+                log::info!("[{mxid}]   🆕 Discovered new room {rid}, downloading room keys …");
+                if let Err(e) = client
+                    .encryption()
+                    .backups()
+                    .download_room_keys_for_room(rid)
+                    .await
+                {
+                    log::error!("[{mxid}]   ✘ Failed to download room keys for {rid}: {e}");
+                }
+                entry.insert(RoomVerificationState::new(joined));
+            }
+        }
+
+        // Collect room IDs in a stable order.
+        let room_ids: Vec<OwnedRoomId> = rooms.keys().cloned().collect();
+
+        // Find rooms that need verification.
+        let verify_candidates: Vec<OwnedRoomId> = room_ids
+            .iter()
+            .filter(|id| rooms[*id].needs_verification())
+            .cloned()
+            .collect();
+
+        // Find rooms eligible for sending (only if we are the first device
+        // and the promotion wait has elapsed).
+        let send_candidates: Vec<OwnedRoomId> = if we_are_first && promoted {
+            room_ids
+                .iter()
+                .filter(|id| rooms[*id].is_send_eligible())
+                .cloned()
+                .collect()
+        } else {
+            vec![]
+        };
+
+        // Find peers that don't have a DM yet (only create DMs if we are the
+        // first device).
+        let peers_with_dm: HashSet<OwnedUserId> = rooms
+            .values()
+            .filter_map(|state| {
+                let targets = state.room.direct_targets();
+                if targets.len() == 1 {
+                    targets
+                        .iter()
+                        .next()
+                        .and_then(|t| OwnedUserId::try_from(t.to_string()).ok())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let dm_candidates: Vec<&UserId> = if we_are_first && promoted {
+            peers
+                .iter()
+                .filter(|p| !peers_with_dm.contains(*p))
+                .map(AsRef::as_ref)
+                .collect()
+        } else {
+            vec![]
+        };
+
+        // Three-way round-robin: try the preferred action first, then fall
+        // through to the others.
+        let actions = [0, 1, 2];
+        let mut did_something = false;
+        for offset in 0..3 {
+            let action = actions[(action_cycle + offset) % 3];
+            match action {
+                0 => {
+                    if let Some(verified) = try_verify(
+                        &mut rooms,
+                        &verify_candidates,
+                        &mut verify_rr,
+                        &our_user_id,
+                        &client,
+                        config.leave_on_failure,
+                    )
+                    .await?
+                    {
+                        log::info!("[{mxid}]   🔍 Verified page in {verified}");
+                        did_something = true;
+                        break;
+                    }
+                }
+                1 => {
+                    if let Some(sent) = try_send(
+                        &mut rooms,
+                        &send_candidates,
+                        &mut send_rr,
+                        config.media_probability,
+                    )
+                    .await
+                    {
+                        log::info!("[{mxid}]   ✔ Sent {sent}");
+                        did_something = true;
+                        break;
+                    }
+                }
+                2 => {
+                    if let Some(result) = try_create_dm(&client, &dm_candidates, &mut dm_rr).await?
+                    {
+                        log::info!("[{mxid}]   {result}");
+                        did_something = true;
+                        break;
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        if did_something {
+            action_cycle = (action_cycle + 1) % 3;
+        }
+
+        // Sleep for 2 seconds, but break early on shutdown.
+        tokio::select! {
+            _ = main_stop_rx.changed() => {
+                break;
+            }
+            _ = sleep(config.loop_interval.sample()) => {}
+        }
+    }
+
+    log::info!("[{mxid}] ✔ Main loop stopped");
+
+    // Signal the sync loop to stop (it shares the same stop_rx).
+    sync_handle.abort();
+    let _ = sync_handle.await;
+    log::info!("[{mxid}] ✔ Sync loop stopped");
+
+    // ── 6. Wait for key backup to finish uploading ──────────────────────
+    log::info!("[{mxid}] ▶ Waiting for room key backup to complete …");
+    client
+        .encryption()
+        .backups()
+        .wait_for_steady_state()
+        .await?;
+    log::info!("[{mxid}] ✔ Key backup upload complete");
+
+    // ── 7. Log out ──────────────────────────────────────────────────────
+    log::info!("[{mxid}] ▶ Logging out …");
+    client.matrix_auth().logout().await?;
+    log::info!("[{mxid}] ✔ Logged out – all done!");
+
+    Ok(())
+}
+
+// ── Action helpers ──────────────────────────────────────────────────────
+
+/// Try to run a verification step on the next room in round-robin order.
+/// Returns `Some(room_id)` if a page was verified, `None` if no candidate.
+/// If verification fails the room is marked as failed and, when
+/// `leave_on_failure` is true, the room is also left.
+#[tracing::instrument(skip_all, fields(room_id))]
+async fn try_verify(
+    rooms: &mut HashMap<OwnedRoomId, RoomVerificationState>,
+    candidates: &[OwnedRoomId],
+    rr: &mut usize,
+    our_user_id: &OwnedUserId,
+    client: &Client,
+    leave_on_failure: bool,
+) -> anyhow::Result<Option<String>> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let idx = *rr % candidates.len();
+    *rr = rr.wrapping_add(1);
+
+    let room_id = &candidates[idx];
+    tracing::Span::current().record("room_id", room_id.as_str());
+
+    let state = rooms.get_mut(room_id).unwrap();
+    let (count, failed) = state.verify_page(our_user_id, client).await?;
+
+    if failed {
+        state.failed = true;
+        if leave_on_failure {
+            tracing::error!("Verification failed – leaving room");
+            if let Err(e) = state.room.leave().await {
+                tracing::error!(error = %e, "Failed to leave room after verification failure");
+            }
+        } else {
+            tracing::error!("Verification failed – room disabled");
+        }
+        return Ok(Some(format!("{room_id} (FAILED)")));
+    }
+
+    tracing::debug!(events = count, "Verified page");
+    Ok(Some(format!("{room_id} ({count} events)")))
+}
+
+/// Try to send a message (or media) to the next send-eligible room in
+/// round-robin order.  When `media_probability` is > 0, a random draw
+/// decides whether to upload a PNG image instead of sending plain text.
+/// Returns `Some(description)` if a message was sent, `None` if no candidate.
+#[tracing::instrument(skip_all, fields(room_id, serial, kind))]
+async fn try_send(
+    rooms: &mut HashMap<OwnedRoomId, RoomVerificationState>,
+    candidates: &[OwnedRoomId],
+    rr: &mut usize,
+    media_probability: f64,
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let idx = *rr % candidates.len();
+    *rr = rr.wrapping_add(1);
+
+    let room_id = &candidates[idx];
+    let state = rooms.get_mut(room_id).unwrap();
+
+    let serial = state.next_serial.unwrap_or(1);
+    let ts = now_millis();
+    let message_text = format!("Message #{serial} {ts}");
+
+    let send_media = media_probability > 0.0 && random::<f64>() < media_probability;
+    let kind = if send_media { "media" } else { "text" };
+
+    let span = tracing::Span::current();
+    span.record("room_id", room_id.as_str());
+    span.record("serial", serial);
+    span.record("kind", kind);
+
+    let result = if send_media {
+        let png_data = image::generate_png();
+        let config = AttachmentConfig::new()
+            .info(AttachmentInfo::Image(BaseImageInfo {
+                width: Some(UInt::new(image::IMAGE_WIDTH as u64).unwrap()),
+                height: Some(UInt::new(image::IMAGE_HEIGHT as u64).unwrap()),
+                size: Some(UInt::new(png_data.len() as u64).unwrap()),
+                ..Default::default()
+            }))
+            .caption(Some(TextMessageEventContent::plain(&message_text)));
+
+        state
+            .room
+            .send_attachment("image.png", &mime::IMAGE_PNG, png_data, config)
+            .await
+            .map(|_| ())
+    } else {
+        let content = RoomMessageEventContent::text_plain(&message_text);
+        state.room.send(content).await.map(|_| ())
+    };
+
+    match result {
+        Ok(()) => {
+            state.next_serial = Some(serial + 1);
+            tracing::info!("Message sent");
+            Some(format!("{kind} #{serial} to {room_id}"))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to send message");
+            None
+        }
+    }
+}
+
+/// Try to create a DM with the next peer in round-robin order.
+/// Returns `Some(description)` if the step was taken (even if no room was
+/// created due to missing E2EE keys), `None` if there are no candidates.
+#[tracing::instrument(skip_all, fields(peer))]
+async fn try_create_dm(
+    client: &Client,
+    candidates: &[&UserId],
+    rr: &mut usize,
+) -> anyhow::Result<Option<String>> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let idx = *rr % candidates.len();
+    *rr = rr.wrapping_add(1);
+
+    let peer = candidates[idx];
+    tracing::Span::current().record("peer", peer.as_str());
+
+    // Query the server directly for device keys (the local device list may
+    // be empty for users we don't share a room with yet).
+    let mut device_keys_request = get_keys::v3::Request::new();
+    device_keys_request
+        .device_keys
+        .insert(peer.to_owned(), vec![]);
+
+    match client.send(device_keys_request).await {
+        Ok(response) => {
+            let has_devices = response
+                .device_keys
+                .get(peer)
+                .is_some_and(|devices| !devices.is_empty());
+            if !has_devices {
+                tracing::info!("Skipped DM – no device_keys in /keys/query");
+                return Ok(Some(format!(
+                    "⏭ Skipped DM with {peer} (no device_keys in /keys/query)"
+                )));
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Skipped DM – failed /keys/query");
+            return Ok(Some(format!(
+                "⏭ Skipped DM with {peer} (failed /keys/query: {e})"
+            )));
+        }
+    }
+
+    match client.create_dm(peer).await {
+        Ok(room) => {
+            tracing::info!(room_id = %room.room_id(), "Created DM");
+            Ok(Some(format!(
+                "🤝 Created DM {} with {peer}",
+                room.room_id()
+            )))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to create DM");
+            Ok(Some(format!("✘ Failed to create DM with {peer}: {e}")))
+        }
+    }
+}
