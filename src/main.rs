@@ -6,8 +6,12 @@ mod telemetry;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    net::{IpAddr, Ipv6Addr},
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -37,7 +41,15 @@ use matrix_sdk::{
     },
 };
 use rand::{Rng, random};
-use tokio::{signal, sync::Mutex as TokioMutex, sync::watch, time::sleep};
+use tokio::{
+    io::AsyncReadExt,
+    net::TcpListener,
+    signal,
+    sync::{Mutex as TokioMutex, Notify, watch},
+    time::sleep,
+};
+
+use crate::registration::RegistrationError;
 
 /// Classifies the relationship between the local user and the sender of a
 /// received message, used as a structured field on delivery-time log lines.
@@ -335,6 +347,20 @@ struct Config {
     /// Comma-separated domain patterns for auto-accepting room invites.
     #[arg(long, env = "ACCEPT_INVITE_DOMAINS", value_delimiter = ',')]
     accept_invite_domains: Vec<InviteDomainPattern>,
+
+    /// Seconds to wait before restarting a failed `run_user` invocation.
+    /// Only one restart is attempted at a time; additional failed
+    /// invocations queue behind the first using the normal login-interval
+    /// stagger.
+    #[arg(long, env = "RESTART_INTERVAL", default_value = "5")]
+    restart_interval: IntervalRange,
+
+    /// TCP port on localhost to open once all users have completed E2EE
+    /// recovery (step 4).  The server is closed again when any `run_user`
+    /// invocation is aborted.  Accepted connections are closed as soon as a
+    /// single byte is received.  When unset, readiness probing is disabled.
+    #[arg(long, env = "READINESS_PORT")]
+    readiness_port: Option<u16>,
 }
 
 // ── Small helpers ───────────────────────────────────────────────────────
@@ -637,6 +663,44 @@ impl RoomVerificationState {
     }
 }
 
+// ── run_user outcome types ──────────────────────────────────────────────
+
+/// Distinguishes errors that should abort `run_user` permanently (until
+/// restart) from transient errors that the caller can retry.
+#[derive(Debug)]
+enum RunUserError {
+    /// A fatal error: sync returned 401/404, or registration failed with 404.
+    /// The invocation should be restarted after `RESTART_INTERVAL`.
+    Fatal(anyhow::Error),
+    /// A non-fatal error (e.g. network hiccup).  Treated the same as Fatal
+    /// for restart purposes today, but kept separate for clarity.
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for RunUserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fatal(e) => write!(f, "fatal: {e:#}"),
+            Self::Other(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl RunUserError {
+    /// Wrap an `anyhow::Error` as a non-fatal error.
+    fn other(e: anyhow::Error) -> Self {
+        Self::Other(e)
+    }
+}
+
+/// Outcome of a single `run_user` invocation.
+enum RunUserOutcome {
+    /// Graceful shutdown (stop signal received).  Do NOT restart.
+    Shutdown,
+    /// The run failed and should be restarted after `RESTART_INTERVAL`.
+    Failed(RunUserError),
+}
+
 // ── Entry point ─────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -694,16 +758,40 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // ── Spawn one task per user (staggered) ─────────────────────────────
-    let mut handles = Vec::with_capacity(config.users.len());
+    // ── Readiness state ─────────────────────────────────────────────────
+    let total_users = config.users.len();
+    let ready_count = Arc::new(AtomicUsize::new(0));
+    let (ready_tx, ready_rx) = watch::channel(false);
+    let ready_tx = Arc::new(ready_tx);
+
+    // Spawn readiness TCP server if a port was configured.
+    if let Some(port) = config.readiness_port {
+        let rr = ready_rx.clone();
+        let sr = stop_rx.clone();
+        tokio::spawn(readiness_server(port, rr, sr));
+    }
+
+    // ── Restart serialisation ───────────────────────────────────────────
+    // A shared mutex ensures that when multiple `run_user` invocations
+    // fail concurrently, only one restarts at a time.  After a successful
+    // login the holder sleeps `login_interval` (stagger) before releasing
+    // the lock so the next restart can proceed.
+    let restart_mutex: Arc<TokioMutex<()>> = Arc::new(TokioMutex::new(()));
+
+    // ── Spawn one supervisor task per user (staggered) ──────────────────
+    let mut handles = Vec::with_capacity(total_users);
     let mut stagger = Duration::ZERO;
     for user in config.users.clone() {
         let user_stagger = stagger;
         stagger += config.login_interval.sample();
         let config = config.clone();
         let stop_rx = stop_rx.clone();
+        let ready_count = ready_count.clone();
+        let ready_tx = ready_tx.clone();
+        let restart_mutex = restart_mutex.clone();
+
         let handle = tokio::spawn(async move {
-            // Wait for the stagger delay, but bail out early on shutdown.
+            // ── Initial stagger ─────────────────────────────────────────
             if !user_stagger.is_zero() {
                 let mut stop = stop_rx.clone();
                 tokio::select! {
@@ -714,15 +802,99 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+
             let mxid = user.mxid.as_str().to_owned();
-            if let Err(e) = run_user(user, config, stop_rx).await {
-                log::error!("[{mxid}] Fatal error: {e:#}");
+            let restart_interval = config.restart_interval.sample();
+            let login_interval_range = config.login_interval;
+            let mut first_run = true;
+
+            loop {
+                if *stop_rx.borrow() {
+                    break;
+                }
+
+                // On restart (not the very first run), serialise through
+                // the restart mutex so only one user retries at a time.
+                let restart_guard = if !first_run {
+                    let guard = restart_mutex.lock().await;
+                    if *stop_rx.borrow() {
+                        break;
+                    }
+
+                    // Wait RESTART_INTERVAL before starting the retry.
+                    let mut stop = stop_rx.clone();
+                    tokio::select! {
+                        _ = sleep(restart_interval) => {}
+                        _ = stop.changed() => { break; }
+                    }
+                    if *stop_rx.borrow() {
+                        break;
+                    }
+
+                    log::info!("[{mxid}] ⟳ Restarting …");
+                    Some(guard)
+                } else {
+                    None
+                };
+                first_run = false;
+
+                let login_notify = Arc::new(Notify::new());
+
+                let run_future = run_user(
+                    user.clone(),
+                    config.clone(),
+                    stop_rx.clone(),
+                    ready_count.clone(),
+                    ready_tx.clone(),
+                    total_users,
+                    login_notify.clone(),
+                );
+                tokio::pin!(run_future);
+
+                // If we hold the restart guard, keep it until login
+                // succeeds (+ stagger) so the next restart waits.
+                if restart_guard.is_some() {
+                    let login_signaled = tokio::select! {
+                        _ = login_notify.notified() => true,
+                        outcome = &mut run_future => {
+                            // run_user finished before login – failed early
+                            drop(restart_guard);
+                            match outcome {
+                                RunUserOutcome::Shutdown => return,
+                                RunUserOutcome::Failed(e) => {
+                                    log::error!("[{mxid}] Run failed: {e}");
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+
+                    if login_signaled {
+                        // Stagger before releasing the lock for the next
+                        // restart.
+                        let mut stop = stop_rx.clone();
+                        tokio::select! {
+                            _ = sleep(login_interval_range.sample()) => {}
+                            _ = stop.changed() => {}
+                        }
+                    }
+                    // restart_guard is dropped here, releasing the mutex.
+                }
+
+                // Await run_user completion (may already be done).
+                match run_future.await {
+                    RunUserOutcome::Shutdown => break,
+                    RunUserOutcome::Failed(e) => {
+                        log::error!("[{mxid}] Run failed: {e}");
+                        continue; // loop back → restart path
+                    }
+                }
             }
         });
         handles.push(handle);
     }
 
-    // Wait for all user tasks to finish.
+    // Wait for all supervisor tasks to finish.
     for handle in handles {
         let _ = handle.await;
     }
@@ -733,23 +905,153 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── Readiness TCP server ────────────────────────────────────────────────
+
+/// Listen on `127.0.0.1:<port>` exactly while all `run_user` invocations
+/// are "ready" (reached step 4).  Accepted connections are closed as soon
+/// as a single byte is received.
+async fn readiness_server(
+    port: u16,
+    mut ready_rx: watch::Receiver<bool>,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    loop {
+        // ── Wait until ready ────────────────────────────────────────────
+        loop {
+            if *stop_rx.borrow() {
+                return;
+            }
+            if *ready_rx.borrow() {
+                break;
+            }
+            tokio::select! {
+                _ = ready_rx.changed() => {}
+                _ = stop_rx.changed() => { return; }
+            }
+        }
+
+        // ── Bind ────────────────────────────────────────────────────────
+        let listener = match TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).await {
+            Ok(l) => l,
+            Err(e) => {
+                log::error!("Failed to bind readiness port {port}: {e}");
+                return;
+            }
+        };
+
+        log::info!("✔ Readiness server listening on {port}");
+
+        // ── Accept until no longer ready or shutdown ────────────────────
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    if let Ok((mut stream, _)) = result {
+                        tokio::spawn(async move {
+                            let _ = stream.read(&mut [0u8; 1]).await;
+                        });
+                    }
+                }
+                _ = ready_rx.changed() => {
+                    if !*ready_rx.borrow() {
+                        log::info!("⚠ Readiness lost – closing readiness server");
+                        break; // go back to "wait until ready"
+                    }
+                }
+                _ = stop_rx.changed() => {
+                    return;
+                }
+            }
+        }
+        // listeners are dropped here
+    }
+}
+
+// ── Helpers for fatal-error detection ───────────────────────────────────
+
+/// Check whether a `matrix_sdk::Error` carries an HTTP 401 or 404 status.
+fn is_fatal_sync_status(err: &matrix_sdk::Error) -> bool {
+    let matrix_sdk::Error::Http(http_err) = err else {
+        return false;
+    };
+
+    // Try the structured Matrix client-API error (most common path for
+    // sync responses with a JSON body containing `errcode`).
+    if let Some(api_err) = http_err.as_client_api_error() {
+        let code = api_err.status_code.as_u16();
+        return code == 401 || code == 404;
+    }
+
+    // Non-client-API Matrix error (e.g. reverse-proxy HTML page that
+    // the SDK parsed into `RumaApiError::Other`).
+    if let Some(matrix_sdk::RumaApiError::Other(e)) = http_err.as_ruma_api_error() {
+        let code = e.status_code.as_u16();
+        return code == 401 || code == 404;
+    }
+
+    // Plain reqwest transport error that still carries an HTTP status
+    // (e.g. the server replied but the body was unparsable).
+    if let matrix_sdk::HttpError::Reqwest(req_err) = http_err.as_ref()
+        && let Some(status) = req_err.status()
+    {
+        let code = status.as_u16();
+        return code == 401 || code == 404;
+    }
+
+    false
+}
+
+/// Update the readiness watch channel after the ready-count changes.
+fn update_readiness(count: &AtomicUsize, total: usize, tx: &watch::Sender<bool>) {
+    let current = count.load(Ordering::SeqCst);
+    let _ = tx.send(current >= total);
+}
+
 // ── Per-user lifecycle ──────────────────────────────────────────────────
 
 /// Run the full lifecycle for a single user: register, log in, set up E2EE,
-/// verify rooms, send messages, create DMs.  Returns when the shutdown
-/// signal fires or an unrecoverable error occurs.
+/// verify rooms, send messages, create DMs.  Returns a [`RunUserOutcome`]
+/// indicating whether the run ended due to a shutdown signal or a failure
+/// that should trigger a restart.
 async fn run_user(
     user: UserSpec,
     config: Config,
     stop_rx: watch::Receiver<bool>,
-) -> anyhow::Result<()> {
+    ready_count: Arc<AtomicUsize>,
+    ready_tx: Arc<watch::Sender<bool>>,
+    total_users: usize,
+    login_notify: Arc<Notify>,
+) -> RunUserOutcome {
+    // RAII guard: when this function returns for *any* reason, decrement
+    // the ready count (if it was incremented) and update the readiness
+    // watch channel.
+    struct ReadyGuard {
+        incremented: bool,
+        count: Arc<AtomicUsize>,
+        total: usize,
+        tx: Arc<watch::Sender<bool>>,
+    }
+    impl Drop for ReadyGuard {
+        fn drop(&mut self) {
+            if self.incremented {
+                self.count.fetch_sub(1, Ordering::SeqCst);
+                update_readiness(&self.count, self.total, &self.tx);
+            }
+        }
+    }
+    let mut ready_guard = ReadyGuard {
+        incremented: false,
+        count: ready_count.clone(),
+        total: total_users,
+        tx: ready_tx.clone(),
+    };
+
     let mxid = user.mxid.as_str().to_owned();
     let homeserver_url = &user.homeserver_url;
     let username = &user.username;
     let peers = &user.peers;
 
     // ── 1 & 2. Register (if applicable) and log in ─────────────────────
-    let client = Client::builder()
+    let client = match Client::builder()
         .homeserver_url(homeserver_url)
         .with_encryption_settings(EncryptionSettings {
             auto_enable_cross_signing: true,
@@ -757,13 +1059,17 @@ async fn run_user(
             ..Default::default()
         })
         .build()
-        .await?;
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => return RunUserOutcome::Failed(RunUserError::other(e.into())),
+    };
 
     let initial_name = format!("{:0>11x}", now_millis());
     assert_eq!(initial_name.len(), 11);
 
     let server_name = user.mxid.server_name().as_str();
-    config
+    if let Err(e) = config
         .auth
         .login(
             &client,
@@ -773,7 +1079,20 @@ async fn run_user(
             &mxid,
             &initial_name,
         )
-        .await?;
+        .await
+    {
+        // Registration 404 → the admin API is unreachable; treat as fatal.
+        if e.downcast_ref::<RegistrationError>()
+            .is_some_and(|reg_err| reg_err.status.is_some_and(|s| s.as_u16() == 404))
+        {
+            return RunUserOutcome::Failed(RunUserError::Fatal(e));
+        }
+        return RunUserOutcome::Failed(RunUserError::other(e));
+    }
+
+    // Login succeeded – notify the supervisor so restart staggering can
+    // proceed.
+    login_notify.notify_one();
 
     let recovery_passphrase = config.auth.recovery_passphrase(&mxid);
 
@@ -786,7 +1105,15 @@ async fn run_user(
 
     // ── 3. Set up E2EE (cross-signing + recovery / secret storage) ──────
     log::info!("[{mxid}] ▶ Running initial sync …");
-    client.sync_once(SyncSettings::default()).await?;
+    match client.sync_once(SyncSettings::default()).await {
+        Ok(_) => {}
+        Err(e) => {
+            if is_fatal_sync_status(&e) {
+                return RunUserOutcome::Failed(RunUserError::Fatal(e.into()));
+            }
+            return RunUserOutcome::Failed(RunUserError::other(e.into()));
+        }
+    }
 
     // Accept pending invites from rooms whose server name matches the
     // configured ACCEPT_INVITE_DOMAINS patterns.
@@ -809,7 +1136,15 @@ async fn run_user(
                     Err(e) => log::error!("[{mxid}]   ✘ Failed to join {}: {e}", room.room_id()),
                 }
             }
-            client.sync_once(SyncSettings::default()).await?;
+            match client.sync_once(SyncSettings::default()).await {
+                Ok(_) => {}
+                Err(e) => {
+                    if is_fatal_sync_status(&e) {
+                        return RunUserOutcome::Failed(RunUserError::Fatal(e.into()));
+                    }
+                    return RunUserOutcome::Failed(RunUserError::other(e.into()));
+                }
+            }
         }
     }
 
@@ -819,21 +1154,34 @@ async fn run_user(
     match recovery.state() {
         RecoveryState::Enabled | RecoveryState::Incomplete => {
             log::info!("[{mxid}] ▶ Recovering existing secrets …");
-            recovery.recover(&recovery_passphrase).await?;
+            match recovery.recover(&recovery_passphrase).await {
+                Ok(_) => {}
+                Err(e) => return RunUserOutcome::Failed(RunUserError::other(e.into())),
+            }
             log::info!("[{mxid}] ✔ Existing recovery secrets imported");
         }
         _ => {
             log::info!("[{mxid}] ▶ Enabling recovery …");
-            let _recovery_key = recovery
+            match recovery
                 .enable()
                 .wait_for_backups_to_upload()
                 .with_passphrase(&recovery_passphrase)
-                .await?;
+                .await
+            {
+                Ok(_recovery_key) => {}
+                Err(e) => return RunUserOutcome::Failed(RunUserError::other(e.into())),
+            }
             log::info!("[{mxid}] ✔ E2EE recovery enabled (passphrase-protected)");
         }
     }
 
     // ── 4. Register event handlers and start background sync ────────────
+
+    // Signal readiness: E2EE recovery is complete for this user.
+    ready_guard.incremented = true;
+    ready_count.fetch_add(1, Ordering::SeqCst);
+    update_readiness(&ready_count, total_users, &ready_tx);
+    log::info!("[{mxid}] ✔ User ready (E2EE recovery complete)");
 
     let live_serials: LiveSerials = Arc::new(TokioMutex::new(HashMap::new()));
 
@@ -965,10 +1313,16 @@ async fn run_user(
     );
 
     // Spawn the background sync loop.
+    //
+    // The sync task sets `sync_fatal_tx` to `true` when it encounters an
+    // HTTP 401 or 404 – the main loop picks this up and aborts `run_user`
+    // so the supervisor can restart it.
+    let (sync_fatal_tx, sync_fatal_rx) = watch::channel(false);
     let sync_client = client.clone();
     let mut sync_stop_rx = stop_rx.clone();
     let sync_timeout = config.sync_timeout;
     let sync_error_delay = config.sync_error_delay;
+    let sync_mxid = mxid.clone();
     let sync_handle = tokio::spawn(async move {
         let settings = SyncSettings::default().timeout(Duration::from_secs(sync_timeout));
 
@@ -980,6 +1334,11 @@ async fn run_user(
                 }
                 result = sync => {
                     if let Err(e) = result {
+                        if is_fatal_sync_status(&e) {
+                            log::error!("[{sync_mxid}]  ✘ Fatal sync error (aborting): {e}");
+                            let _ = sync_fatal_tx.send(true);
+                            break;
+                        }
                         log::error!("  ✘ Sync error: {e}");
                         sleep(sync_error_delay.sample()).await;
                     }
@@ -1029,6 +1388,16 @@ async fn run_user(
     loop {
         if *main_stop_rx.borrow() {
             break;
+        }
+
+        // Check for fatal sync errors (401 / 404).
+        if *sync_fatal_rx.borrow() {
+            log::error!("[{mxid}] Sync reported fatal error – aborting run_user");
+            sync_handle.abort();
+            let _ = sync_handle.await;
+            return RunUserOutcome::Failed(RunUserError::Fatal(anyhow::anyhow!(
+                "sync returned 401 or 404"
+            )));
         }
 
         // Update next_serial in each room from live sync data so that
@@ -1167,7 +1536,7 @@ async fn run_user(
             let action = actions[(action_cycle + offset) % 3];
             match action {
                 0 => {
-                    if let Some(verified) = try_verify(
+                    let verify_result = try_verify(
                         &mut rooms,
                         &verify_candidates,
                         &mut verify_rr,
@@ -1175,8 +1544,14 @@ async fn run_user(
                         &client,
                         config.leave_on_failure,
                     )
-                    .await?
-                    {
+                    .await;
+                    if let Some(verified) = match verify_result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log::error!("[{mxid}] Verification error: {e:#}");
+                            None
+                        }
+                    } {
                         log::info!("[{mxid}]   🔍 Verified page in {verified}");
                         did_something = true;
                         break;
@@ -1197,8 +1572,14 @@ async fn run_user(
                     }
                 }
                 2 => {
-                    if let Some(result) = try_create_dm(&client, &dm_candidates, &mut dm_rr).await?
-                    {
+                    let dm_result = try_create_dm(&client, &dm_candidates, &mut dm_rr).await;
+                    if let Some(result) = match dm_result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log::error!("[{mxid}] DM creation error: {e:#}");
+                            None
+                        }
+                    } {
                         log::info!("[{mxid}]   {result}");
                         did_something = true;
                         break;
@@ -1212,10 +1593,21 @@ async fn run_user(
             action_cycle = (action_cycle + 1) % 3;
         }
 
-        // Sleep for 2 seconds, but break early on shutdown.
+        // Sleep for 2 seconds, but break early on shutdown or fatal sync.
+        let mut sync_fatal_watcher = sync_fatal_rx.clone();
         tokio::select! {
             _ = main_stop_rx.changed() => {
                 break;
+            }
+            _ = sync_fatal_watcher.changed() => {
+                if *sync_fatal_watcher.borrow() {
+                    log::error!("[{mxid}] Sync reported fatal error – aborting run_user");
+                    sync_handle.abort();
+                    let _ = sync_handle.await;
+                    return RunUserOutcome::Failed(RunUserError::Fatal(
+                        anyhow::anyhow!("sync returned 401 or 404"),
+                    ));
+                }
             }
             _ = sleep(config.loop_interval.sample()) => {}
         }
@@ -1230,19 +1622,25 @@ async fn run_user(
 
     // ── 6. Wait for key backup to finish uploading ──────────────────────
     log::info!("[{mxid}] ▶ Waiting for room key backup to complete …");
-    client
-        .encryption()
-        .backups()
-        .wait_for_steady_state()
-        .await?;
+    match client.encryption().backups().wait_for_steady_state().await {
+        Ok(_) => {}
+        Err(e) => {
+            log::error!("[{mxid}] ✘ Key backup wait failed: {e}");
+        }
+    }
     log::info!("[{mxid}] ✔ Key backup upload complete");
 
     // ── 7. Log out ──────────────────────────────────────────────────────
     log::info!("[{mxid}] ▶ Logging out …");
-    client.matrix_auth().logout().await?;
+    match client.matrix_auth().logout().await {
+        Ok(_) => {}
+        Err(e) => {
+            log::error!("[{mxid}] ✘ Logout failed: {e}");
+        }
+    }
     log::info!("[{mxid}] ✔ Logged out – all done!");
 
-    Ok(())
+    RunUserOutcome::Shutdown
 }
 
 // ── Action helpers ──────────────────────────────────────────────────────
@@ -1271,7 +1669,10 @@ async fn try_verify(
     tracing::Span::current().record("room_id", room_id.as_str());
 
     let state = rooms.get_mut(room_id).unwrap();
-    let (count, failed) = state.verify_page(our_user_id, client).await?;
+    let (count, failed) = match state.verify_page(our_user_id, client).await {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
 
     if failed {
         state.failed = true;
