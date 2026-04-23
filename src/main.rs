@@ -6,7 +6,7 @@ mod telemetry;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    net::{IpAddr, Ipv6Addr},
+    net::Ipv6Addr,
     str::FromStr,
     sync::{
         Arc,
@@ -878,8 +878,11 @@ async fn main() -> anyhow::Result<()> {
                             _ = stop.changed() => {}
                         }
                     }
-                    // restart_guard is dropped here, releasing the mutex.
                 }
+
+                // Release the mutex so the next queued restart can proceed
+                // while this run_user continues in the background.
+                drop(restart_guard);
 
                 // Await run_user completion (may already be done).
                 match run_future.await {
