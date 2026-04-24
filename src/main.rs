@@ -25,8 +25,8 @@ use matrix_sdk::{
     media::{MediaFormat, MediaRequestParameters},
     room::MessagesOptions,
     ruma::{
-        OwnedRoomId, OwnedUserId, UInt, UserId,
-        api::client::keys::get_keys,
+        OwnedDeviceId, OwnedRoomId, OwnedUserId, UInt, UserId,
+        api::client::{keys::get_keys, uiaa},
         events::{
             AnySyncMessageLikeEvent, AnySyncTimelineEvent,
             room::{
@@ -362,6 +362,12 @@ struct Config {
     /// single byte is received.  When unset, readiness probing is disabled.
     #[arg(long, env = "READINESS_PORT")]
     readiness_port: Option<u16>,
+
+    /// Seconds after which a device is considered stale based on its
+    /// `last_seen_ts`.  Stale devices are logged out and excluded from the
+    /// first-device election.
+    #[arg(long, env = "STALE_DEVICE_TIMEOUT", default_value_t = 300)]
+    stale_device_timeout: u64,
 }
 
 // ── Small helpers ───────────────────────────────────────────────────────
@@ -369,14 +375,85 @@ struct Config {
 /// Check whether our device is the "first" for the account.
 /// Only the first device should send messages to avoid duplicates when
 /// multiple clients are logged in.
-async fn is_first_device(client: &Client) -> bool {
+///
+/// Devices whose `last_seen_ts` is older than `stale_timeout` are considered
+/// stale: they are excluded from the election and deleted from the server
+/// (which requires the UIAA password flow).
+async fn is_first_device(
+    client: &Client,
+    stale_timeout: Duration,
+    account_password: Option<&str>,
+    username: &str,
+) -> bool {
     let Ok(response) = client.devices().await else {
         return false;
     };
 
+    let stale_device_ids: Vec<OwnedDeviceId> = response
+        .devices
+        .iter()
+        .filter(|d| client.device_id() != Some(&*d.device_id))
+        .filter(|d| {
+            d.last_seen_ts
+                .and_then(|ts| ts.to_system_time())
+                .and_then(|ts| SystemTime::now().duration_since(ts).ok())
+                .is_some_and(|duration| duration > stale_timeout)
+        })
+        .map(|d| d.device_id.clone())
+        .collect();
+
+    if !stale_device_ids.is_empty() {
+        log::info!(
+            "Deleting {} stale device(s): {:?}",
+            stale_device_ids.len(),
+            stale_device_ids,
+        );
+
+        // First request without auth data – the server responds with a
+        // UIAA challenge (HTTP 401) containing the session token.
+        match client.delete_devices(&stale_device_ids, None).await {
+            Ok(_) => {
+                // Server accepted without UIAA (unlikely but valid).
+                log::info!("Stale devices deleted (no UIAA required)");
+            }
+            Err(err) => {
+                if let Some(uiaa_info) = err.as_uiaa_response() {
+                    if let Some(password) = account_password {
+                        let mut pw = uiaa::Password::new(
+                            uiaa::UserIdentifier::UserIdOrLocalpart(username.to_owned()),
+                            password.to_owned(),
+                        );
+                        pw.session = uiaa_info.session.clone();
+
+                        match client
+                            .delete_devices(&stale_device_ids, Some(uiaa::AuthData::Password(pw)))
+                            .await
+                        {
+                            Ok(_) => {
+                                log::info!("Stale devices deleted via UIAA password flow");
+                            }
+                            Err(e) => {
+                                log::error!("Failed to delete stale devices (UIAA retry): {e}");
+                            }
+                        }
+                    } else {
+                        log::warn!(
+                            "Cannot delete stale devices: UIAA password flow required \
+                             but no account password is available"
+                        );
+                    }
+                } else {
+                    log::error!("Failed to delete stale devices: {err}");
+                }
+            }
+        }
+    }
+
+    // Determine the first device among non-stale devices only.
     let first_dev = response
         .devices
         .iter()
+        .filter(|d| !stale_device_ids.contains(&d.device_id))
         .min_by_key(|d| (&d.display_name, &d.device_id));
 
     client
@@ -1398,7 +1475,15 @@ async fn run_user(
     // When we first become the first device we wait `promotion_wait_cycles`
     // main-loop ticks before actually sending, so that other devices have a
     // chance to appear.
-    let mut we_are_first = is_first_device(&client).await;
+    let account_password = config.auth.account_password(&mxid);
+    let stale_device_timeout = Duration::from_secs(config.stale_device_timeout);
+    let mut we_are_first = is_first_device(
+        &client,
+        stale_device_timeout,
+        account_password.as_deref(),
+        username,
+    )
+    .await;
     let mut promotion_counter: u64 = 0;
     let mut promoted = false;
     if we_are_first {
@@ -1470,7 +1555,13 @@ async fn run_user(
 
         // Re-check first-device status (handles other devices logging out).
         let was_first = we_are_first;
-        we_are_first = is_first_device(&client).await;
+        we_are_first = is_first_device(
+            &client,
+            stale_device_timeout,
+            account_password.as_deref(),
+            username,
+        )
+        .await;
         if we_are_first && !was_first {
             // Just became the first device – start the promotion countdown.
             promotion_counter = 0;
