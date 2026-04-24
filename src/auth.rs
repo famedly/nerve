@@ -79,19 +79,49 @@ impl AuthConfig {
         if let Some(shared_registration_secret) = &self.shared_registration_secret {
             let password_secret = self.password_secret.as_ref().unwrap();
             let account_password = derive_secret(password_secret, mxid);
-            log::info!("[{mxid}] ▶ Registering on {homeserver_url} …");
+
+            tracing::info!(
+                server_name,
+                username,
+                "[{mxid}] ▶ Registering on {homeserver_url} …",
+            );
+
             let http = reqwest::Client::new();
-            registration::register_with_shared_secret(
+            let reg_result = registration::register_with_shared_secret(
                 &http,
                 homeserver_url,
                 shared_registration_secret,
                 username,
                 &account_password,
             )
-            .await?;
-            log::info!("[{mxid}] ✔ Registered");
+            .await;
 
-            log::info!("[{mxid}] ▶ Logging in with password …");
+            match &reg_result {
+                Ok(()) => {
+                    tracing::info!(
+                        server_name,
+                        username,
+                        server_reachability = true,
+                        "[{mxid}] ✔ Registered",
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        server_name,
+                        username,
+                        server_reachability = false,
+                        error = %e,
+                        "[{mxid}] ✘ Registration failed",
+                    );
+                }
+            }
+            reg_result?;
+
+            tracing::info!(
+                server_name,
+                username,
+                "[{mxid}] ▶ Logging in with password …",
+            );
             client
                 .matrix_auth()
                 .login_username(username, &account_password)
@@ -99,7 +129,12 @@ impl AuthConfig {
                 .send()
                 .await?;
         } else if let Some(sta_secret) = self.resolve_sta_secret(server_name) {
-            log::info!("[{mxid}] ▶ Logging in via STA (JWT) …");
+            tracing::info!(
+                server_name,
+                username,
+                "[{mxid}] ▶ Logging in via STA (JWT) …",
+            );
+
             let exp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -119,12 +154,33 @@ impl AuthConfig {
             );
             data.insert("token".to_owned(), serde_json::Value::String(token));
 
-            client
+            let builder = client
                 .matrix_auth()
                 .login_custom("com.famedly.login.token", data)?
-                .initial_device_display_name(initial_device_display_name)
-                .send()
-                .await?;
+                .initial_device_display_name(initial_device_display_name);
+
+            let login_result = builder.send().await;
+
+            match &login_result {
+                Ok(_) => {
+                    tracing::info!(
+                        server_name,
+                        username,
+                        server_reachability = true,
+                        "[{mxid}] ✔ STA login succeeded",
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        server_name,
+                        username,
+                        server_reachability = false,
+                        error = %e,
+                        "[{mxid}] ✘ STA login failed",
+                    );
+                }
+            }
+            login_result?;
         } else {
             panic!("violated clap requirements");
         }

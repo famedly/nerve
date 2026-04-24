@@ -48,6 +48,7 @@ use tokio::{
     sync::{Mutex as TokioMutex, Notify, watch},
     time::sleep,
 };
+use tracing::Instrument;
 
 use crate::registration::RegistrationError;
 
@@ -1015,6 +1016,13 @@ fn update_readiness(count: &AtomicUsize, total: usize, tx: &watch::Sender<bool>)
 /// verify rooms, send messages, create DMs.  Returns a [`RunUserOutcome`]
 /// indicating whether the run ended due to a shutdown signal or a failure
 /// that should trigger a restart.
+#[tracing::instrument(
+    skip_all,
+    fields(
+        server_name = user.mxid.server_name().as_str(),
+        username = user.username.as_str(),
+    )
+)]
 async fn run_user(
     user: UserSpec,
     config: Config,
@@ -1107,11 +1115,16 @@ async fn run_user(
     log::info!("[{mxid}] ✔ Logged in via matrix-sdk");
 
     // ── 3. Set up E2EE (cross-signing + recovery / secret storage) ──────
-    log::info!("[{mxid}] ▶ Running initial sync …");
+    tracing::info!("[{mxid}] ▶ Running initial sync …");
     match client.sync_once(SyncSettings::default()).await {
         Ok(_) => {}
         Err(e) => {
             if is_fatal_sync_status(&e) {
+                tracing::error!(
+                    server_reachability = false,
+                    error = %e,
+                    "[{mxid}] ✘ Initial sync fatal error",
+                );
                 return RunUserOutcome::Failed(RunUserError::Fatal(e.into()));
             }
             return RunUserOutcome::Failed(RunUserError::other(e.into()));
@@ -1143,6 +1156,11 @@ async fn run_user(
                 Ok(_) => {}
                 Err(e) => {
                     if is_fatal_sync_status(&e) {
+                        tracing::error!(
+                            server_reachability = false,
+                            error = %e,
+                            "[{mxid}] ✘ Post-invite sync fatal error",
+                        );
                         return RunUserOutcome::Failed(RunUserError::Fatal(e.into()));
                     }
                     return RunUserOutcome::Failed(RunUserError::other(e.into()));
@@ -1325,30 +1343,38 @@ async fn run_user(
     let mut sync_stop_rx = stop_rx.clone();
     let sync_timeout = config.sync_timeout;
     let sync_error_delay = config.sync_error_delay;
+    let sync_span = tracing::Span::current();
     let sync_mxid = mxid.clone();
-    let sync_handle = tokio::spawn(async move {
-        let settings = SyncSettings::default().timeout(Duration::from_secs(sync_timeout));
+    let sync_handle = tokio::spawn(
+        async move {
+            let settings = SyncSettings::default().timeout(Duration::from_secs(sync_timeout));
 
-        loop {
-            let sync = sync_client.sync_once(settings.clone());
-            tokio::select! {
-                _ = sync_stop_rx.changed() => {
-                    break;
-                }
-                result = sync => {
-                    if let Err(e) = result {
-                        if is_fatal_sync_status(&e) {
-                            log::error!("[{sync_mxid}]  ✘ Fatal sync error (aborting): {e}");
-                            let _ = sync_fatal_tx.send(true);
-                            break;
+            loop {
+                let sync = sync_client.sync_once(settings.clone());
+                tokio::select! {
+                    _ = sync_stop_rx.changed() => {
+                        break;
+                    }
+                    result = sync => {
+                        if let Err(e) = result {
+                            if is_fatal_sync_status(&e) {
+                                tracing::error!(
+                                    server_reachability = false,
+                                    error = %e,
+                                    "[{sync_mxid}] ✘ Fatal sync error (aborting)",
+                                );
+                                let _ = sync_fatal_tx.send(true);
+                                break;
+                            }
+                            log::error!("  ✘ Sync error: {e}");
+                            sleep(sync_error_delay.sample()).await;
                         }
-                        log::error!("  ✘ Sync error: {e}");
-                        sleep(sync_error_delay.sample()).await;
                     }
                 }
             }
         }
-    });
+        .instrument(sync_span),
+    );
 
     // ── 5. Main loop: alternate between verify, send, and DM creation ───
     //
@@ -1395,7 +1421,10 @@ async fn run_user(
 
         // Check for fatal sync errors (401 / 404).
         if *sync_fatal_rx.borrow() {
-            log::error!("[{mxid}] Sync reported fatal error – aborting run_user");
+            tracing::error!(
+                server_reachability = false,
+                "[{mxid}] Sync reported fatal error – aborting run_user",
+            );
             sync_handle.abort();
             let _ = sync_handle.await;
             return RunUserOutcome::Failed(RunUserError::Fatal(anyhow::anyhow!(
@@ -1604,7 +1633,10 @@ async fn run_user(
             }
             _ = sync_fatal_watcher.changed() => {
                 if *sync_fatal_watcher.borrow() {
-                    log::error!("[{mxid}] Sync reported fatal error – aborting run_user");
+                    tracing::error!(
+                        server_reachability = false,
+                        "[{mxid}] Sync reported fatal error – aborting run_user",
+                    );
                     sync_handle.abort();
                     let _ = sync_handle.await;
                     return RunUserOutcome::Failed(RunUserError::Fatal(
