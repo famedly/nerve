@@ -67,6 +67,7 @@ impl AuthConfig {
     }
 
     /// Register (if applicable) and log in to the homeserver.
+    #[tracing::instrument(skip_all, fields(mxid, server_name, username))]
     pub async fn login(
         &self,
         client: &Client,
