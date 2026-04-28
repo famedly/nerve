@@ -403,7 +403,7 @@ async fn is_first_device(
         .collect();
 
     if !stale_device_ids.is_empty() {
-        log::info!(
+        tracing::info!(
             "Deleting {} stale device(s): {:?}",
             stale_device_ids.len(),
             stale_device_ids,
@@ -414,7 +414,7 @@ async fn is_first_device(
         match client.delete_devices(&stale_device_ids, None).await {
             Ok(_) => {
                 // Server accepted without UIAA (unlikely but valid).
-                log::info!("Stale devices deleted (no UIAA required)");
+                tracing::info!("Stale devices deleted (no UIAA required)");
             }
             Err(err) => {
                 if let Some(uiaa_info) = err.as_uiaa_response() {
@@ -430,20 +430,20 @@ async fn is_first_device(
                             .await
                         {
                             Ok(_) => {
-                                log::info!("Stale devices deleted via UIAA password flow");
+                                tracing::info!("Stale devices deleted via UIAA password flow");
                             }
                             Err(e) => {
-                                log::error!("Failed to delete stale devices (UIAA retry): {e}");
+                                tracing::error!("Failed to delete stale devices (UIAA retry): {e}");
                             }
                         }
                     } else {
-                        log::warn!(
+                        tracing::warn!(
                             "Cannot delete stale devices: UIAA password flow required \
                              but no account password is available"
                         );
                     }
                 } else {
-                    log::error!("Failed to delete stale devices: {err}");
+                    tracing::error!("Failed to delete stale devices: {err}");
                 }
             }
         }
@@ -591,7 +591,7 @@ impl RoomVerificationState {
             let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(msg))) =
                 deserialized
             else {
-                log::error!(
+                tracing::error!(
                     "  ⚠ [{}] Unexpected event type (not a room message)",
                     self.room.room_id(),
                 );
@@ -600,7 +600,7 @@ impl RoomVerificationState {
             };
 
             let Some(original) = msg.as_original() else {
-                log::error!("  ⚠ [{}] Redacted room message", self.room.room_id(),);
+                tracing::error!("  ⚠ [{}] Redacted room message", self.room.room_id(),);
                 failed = true;
                 continue;
             };
@@ -614,7 +614,7 @@ impl RoomVerificationState {
                 }
                 MessageType::Image(img) => {
                     let Some(caption) = img.caption() else {
-                        log::error!(
+                        tracing::error!(
                             "  ⚠ [{}] Image without caption from {}",
                             self.room.room_id(),
                             original.sender,
@@ -632,7 +632,7 @@ impl RoomVerificationState {
                     match client.media().get_media_content(&request, true).await {
                         Ok(data) => {
                             if let Err(e) = image::validate_png(&data) {
-                                log::error!(
+                                tracing::error!(
                                     "  ⚠ [{}] Invalid PNG from {}: {e}",
                                     self.room.room_id(),
                                     original.sender,
@@ -642,7 +642,7 @@ impl RoomVerificationState {
                             }
                         }
                         Err(e) => {
-                            log::error!(
+                            tracing::error!(
                                 "  ⚠ [{}] Failed to download media from {}: {e}",
                                 self.room.room_id(),
                                 original.sender,
@@ -653,7 +653,7 @@ impl RoomVerificationState {
                     }
                 }
                 _ => {
-                    log::error!(
+                    tracing::error!(
                         "  ⚠ [{}] Unsupported message type from {}",
                         self.room.room_id(),
                         original.sender,
@@ -664,7 +664,7 @@ impl RoomVerificationState {
             };
 
             let Some((n, _ts)) = parse_message_body(body) else {
-                log::error!(
+                tracing::error!(
                     "  ⚠ [{}] Bad message format from {}: {:?}",
                     self.room.room_id(),
                     original.sender,
@@ -679,7 +679,7 @@ impl RoomVerificationState {
             if let Some(expected) = self.last_serial_by_user.get(&sender) {
                 // Reading backwards: serials should decrease by 1.
                 if *expected > 0 && n != expected - 1 {
-                    log::error!(
+                    tracing::error!(
                         "  ⚠ [{}] Serial mismatch for {sender}: expected #{}, got #{n}",
                         self.room.room_id(),
                         expected - 1,
@@ -693,7 +693,7 @@ impl RoomVerificationState {
             // First (most recent) message from us determines next_serial.
             if &sender == our_user_id && self.next_serial.is_none() {
                 self.next_serial = Some(n + 1);
-                log::info!(
+                tracing::info!(
                     "  🔍 [{}] Found our last serial #{n} → next #{}",
                     self.room.room_id(),
                     n + 1,
@@ -713,12 +713,12 @@ impl RoomVerificationState {
                 // If we never found a message from ourselves, start at #1.
                 if self.next_serial.is_none() {
                     self.next_serial = Some(1);
-                    log::info!(
+                    tracing::info!(
                         "  🔍 [{}] Verification complete (no messages from us, starting at #1)",
                         self.room.room_id()
                     );
                 } else {
-                    log::info!(
+                    tracing::info!(
                         "  🔍 [{}] Verification complete (reached beginning)",
                         self.room.room_id()
                     );
@@ -831,7 +831,7 @@ async fn main() -> anyhow::Result<()> {
         let stop_tx_signal = stop_tx.clone();
         tokio::spawn(async move {
             shutdown_signal().await;
-            log::info!("⚡ Received shutdown signal");
+            tracing::info!("⚡ Received shutdown signal");
             let _ = stop_tx_signal.send(true);
         });
     }
@@ -875,7 +875,7 @@ async fn main() -> anyhow::Result<()> {
                 tokio::select! {
                     _ = sleep(user_stagger) => {}
                     _ = stop.changed() => {
-                        log::info!("[{}] Shutdown before login (stagger cancelled)", user.mxid);
+                        tracing::info!("[{}] Shutdown before login (stagger cancelled)", user.mxid);
                         return;
                     }
                 }
@@ -909,7 +909,7 @@ async fn main() -> anyhow::Result<()> {
                         break;
                     }
 
-                    log::info!("[{mxid}] ⟳ Restarting …");
+                    tracing::info!("[{mxid}] ⟳ Restarting …");
                     Some(guard)
                 } else {
                     None
@@ -940,7 +940,7 @@ async fn main() -> anyhow::Result<()> {
                             match outcome {
                                 RunUserOutcome::Shutdown => return,
                                 RunUserOutcome::Failed(e) => {
-                                    log::error!("[{mxid}] Run failed: {e}");
+                                    tracing::error!("[{mxid}] Run failed: {e}");
                                     continue;
                                 }
                             }
@@ -966,7 +966,7 @@ async fn main() -> anyhow::Result<()> {
                 match run_future.await {
                     RunUserOutcome::Shutdown => break,
                     RunUserOutcome::Failed(e) => {
-                        log::error!("[{mxid}] Run failed: {e}");
+                        tracing::error!("[{mxid}] Run failed: {e}");
                         continue; // loop back → restart path
                     }
                 }
@@ -1015,12 +1015,12 @@ async fn readiness_server(
         let listener = match TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).await {
             Ok(l) => l,
             Err(e) => {
-                log::error!("Failed to bind readiness port {port}: {e}");
+                tracing::error!("Failed to bind readiness port {port}: {e}");
                 return;
             }
         };
 
-        log::info!("✔ Readiness server listening on {port}");
+        tracing::info!("✔ Readiness server listening on {port}");
 
         // ── Accept until no longer ready or shutdown ────────────────────
         loop {
@@ -1034,7 +1034,7 @@ async fn readiness_server(
                 }
                 _ = ready_rx.changed() => {
                     if !*ready_rx.borrow() {
-                        log::info!("⚠ Readiness lost – closing readiness server");
+                        tracing::info!("⚠ Readiness lost – closing readiness server");
                         break; // go back to "wait until ready"
                     }
                 }
@@ -1189,7 +1189,7 @@ async fn run_user(
         .expect("logged in, must have user_id")
         .to_owned();
 
-    log::info!("[{mxid}] ✔ Logged in via matrix-sdk");
+    tracing::info!("[{mxid}] ✔ Logged in via matrix-sdk");
 
     // ── 3. Set up E2EE (cross-signing + recovery / secret storage) ──────
     tracing::info!("[{mxid}] ▶ Running initial sync …");
@@ -1222,11 +1222,11 @@ async fn run_user(
             .collect();
 
         if !invited.is_empty() {
-            log::info!("[{mxid}] ▶ Accepting {} pending invite(s) …", invited.len());
+            tracing::info!("[{mxid}] ▶ Accepting {} pending invite(s) …", invited.len());
             for room in invited {
                 match room.join().await {
-                    Ok(()) => log::info!("[{mxid}]   ✔ Joined {}", room.room_id()),
-                    Err(e) => log::error!("[{mxid}]   ✘ Failed to join {}: {e}", room.room_id()),
+                    Ok(()) => tracing::info!("[{mxid}]   ✔ Joined {}", room.room_id()),
+                    Err(e) => tracing::error!("[{mxid}]   ✘ Failed to join {}: {e}", room.room_id()),
                 }
             }
             match client.sync_once(SyncSettings::default()).await {
@@ -1251,15 +1251,15 @@ async fn run_user(
 
     match recovery.state() {
         RecoveryState::Enabled | RecoveryState::Incomplete => {
-            log::info!("[{mxid}] ▶ Recovering existing secrets …");
+            tracing::info!("[{mxid}] ▶ Recovering existing secrets …");
             match recovery.recover(&recovery_passphrase).await {
                 Ok(_) => {}
                 Err(e) => return RunUserOutcome::Failed(RunUserError::other(e.into())),
             }
-            log::info!("[{mxid}] ✔ Existing recovery secrets imported");
+            tracing::info!("[{mxid}] ✔ Existing recovery secrets imported");
         }
         _ => {
-            log::info!("[{mxid}] ▶ Enabling recovery …");
+            tracing::info!("[{mxid}] ▶ Enabling recovery …");
             match recovery
                 .enable()
                 .wait_for_backups_to_upload()
@@ -1269,7 +1269,7 @@ async fn run_user(
                 Ok(_recovery_key) => {}
                 Err(e) => return RunUserOutcome::Failed(RunUserError::other(e.into())),
             }
-            log::info!("[{mxid}] ✔ E2EE recovery enabled (passphrase-protected)");
+            tracing::info!("[{mxid}] ✔ E2EE recovery enabled (passphrase-protected)");
         }
     }
 
@@ -1279,7 +1279,7 @@ async fn run_user(
     ready_guard.incremented = true;
     ready_count.fetch_add(1, Ordering::SeqCst);
     update_readiness(&ready_count, total_users, &ready_tx);
-    log::info!("[{mxid}] ✔ User ready (E2EE recovery complete)");
+    tracing::info!("[{mxid}] ✔ User ready (E2EE recovery complete)");
 
     let live_serials: LiveSerials = Arc::new(TokioMutex::new(HashMap::new()));
 
@@ -1316,7 +1316,7 @@ async fn run_user(
                                     Ok(data) => {
                                         let size = data.len() as u64;
                                         if let Err(e) = image::validate_png(&data) {
-                                            log::error!(
+                                            tracing::error!(
                                                 "  ⚠ [{room_name}] {}: Media #{serial} \
                                                  invalid PNG: {e}",
                                                 ev.sender,
@@ -1327,7 +1327,7 @@ async fn run_user(
                                         }
                                     }
                                     Err(e) => {
-                                        log::error!(
+                                        tracing::error!(
                                             "  ⚠ [{room_name}] {}: Media #{serial} \
                                              download failed: {e}",
                                             ev.sender,
@@ -1372,10 +1372,10 @@ async fn run_user(
                             *entry = serial;
                         }
                     } else {
-                        log::info!("  📩 [{room_name}] {}: {}", ev.sender, body);
+                        tracing::info!("  📩 [{room_name}] {}: {}", ev.sender, body);
                     }
                 } else {
-                    log::info!("  📩 [{room_name}] {}: (non-text message)", ev.sender);
+                    tracing::info!("  📩 [{room_name}] {}: (non-text message)", ev.sender);
                 }
             }
         },
@@ -1401,10 +1401,10 @@ async fn run_user(
                     return;
                 }
 
-                log::info!("  📨 Invited to {room_id} – joining …");
+                tracing::info!("  📨 Invited to {room_id} – joining …");
                 match room.join().await {
-                    Ok(()) => log::info!("  ✔ Joined {room_id}"),
-                    Err(e) => log::info!("  ✘ Failed to join {room_id}: {e}"),
+                    Ok(()) => tracing::info!("  ✔ Joined {room_id}"),
+                    Err(e) => tracing::info!("  ✘ Failed to join {room_id}: {e}"),
                 }
             }
         },
@@ -1443,7 +1443,7 @@ async fn run_user(
                                 let _ = sync_fatal_tx.send(true);
                                 break;
                             }
-                            log::error!("  ✘ Sync error: {e}");
+                            tracing::error!("  ✘ Sync error: {e}");
                             sleep(sync_error_delay.sample()).await;
                         }
                     }
@@ -1487,17 +1487,17 @@ async fn run_user(
     let mut promotion_counter: u64 = 0;
     let mut promoted = false;
     if we_are_first {
-        log::info!(
+        tracing::info!(
             "[{mxid}] ✔ We are the first device – waiting {wait} cycle(s) before sending",
             wait = config.promotion_wait_cycles
         );
     } else {
-        log::info!("[{mxid}] ℹ Another device is primary – will only verify, not send");
+        tracing::info!("[{mxid}] ℹ Another device is primary – will only verify, not send");
     }
 
     let mut main_stop_rx = stop_rx.clone();
 
-    log::info!("[{mxid}] ▶ Starting verify/send loop (Ctrl-C to stop) …");
+    tracing::info!("[{mxid}] ▶ Starting verify/send loop (Ctrl-C to stop) …");
 
     loop {
         if *main_stop_rx.borrow() {
@@ -1548,7 +1548,7 @@ async fn run_user(
             if joined_ids.contains(rid) {
                 true
             } else {
-                log::info!("[{mxid}]   🚪 Room {rid} is no longer joined, removing from tracking");
+                tracing::info!("[{mxid}]   🚪 Room {rid} is no longer joined, removing from tracking");
                 false
             }
         });
@@ -1566,14 +1566,14 @@ async fn run_user(
             // Just became the first device – start the promotion countdown.
             promotion_counter = 0;
             promoted = false;
-            log::info!(
+            tracing::info!(
                 "[{mxid}]   🔼 We are now the first device – waiting {wait} cycle(s) before sending",
                 wait = config.promotion_wait_cycles
             );
         } else if !we_are_first && was_first {
             promoted = false;
             promotion_counter = 0;
-            log::info!("[{mxid}]   🔽 Another device took over – will stop sending");
+            tracing::info!("[{mxid}]   🔽 Another device took over – will stop sending");
         }
 
         // Advance the promotion counter while we are the first device but
@@ -1582,7 +1582,7 @@ async fn run_user(
             promotion_counter += 1;
             if promotion_counter > config.promotion_wait_cycles {
                 promoted = true;
-                log::info!("[{mxid}]   🔼 Promotion wait complete – will start sending");
+                tracing::info!("[{mxid}]   🔼 Promotion wait complete – will start sending");
             }
         }
 
@@ -1590,14 +1590,14 @@ async fn run_user(
         for joined in client.joined_rooms() {
             let rid = joined.room_id();
             if let std::collections::hash_map::Entry::Vacant(entry) = rooms.entry(rid.to_owned()) {
-                log::info!("[{mxid}]   🆕 Discovered new room {rid}, downloading room keys …");
+                tracing::info!("[{mxid}]   🆕 Discovered new room {rid}, downloading room keys …");
                 if let Err(e) = client
                     .encryption()
                     .backups()
                     .download_room_keys_for_room(rid)
                     .await
                 {
-                    log::error!("[{mxid}]   ✘ Failed to download room keys for {rid}: {e}");
+                    tracing::error!("[{mxid}]   ✘ Failed to download room keys for {rid}: {e}");
                 }
                 entry.insert(RoomVerificationState::new(joined));
             }
@@ -1671,11 +1671,11 @@ async fn run_user(
                     if let Some(verified) = match verify_result {
                         Ok(v) => v,
                         Err(e) => {
-                            log::error!("[{mxid}] Verification error: {e:#}");
+                            tracing::error!("[{mxid}] Verification error: {e:#}");
                             None
                         }
                     } {
-                        log::info!("[{mxid}]   🔍 Verified page in {verified}");
+                        tracing::info!("[{mxid}]   🔍 Verified page in {verified}");
                         did_something = true;
                         break;
                     }
@@ -1689,7 +1689,7 @@ async fn run_user(
                     )
                     .await
                     {
-                        log::info!("[{mxid}]   ✔ Sent {sent}");
+                        tracing::info!("[{mxid}]   ✔ Sent {sent}");
                         did_something = true;
                         break;
                     }
@@ -1699,11 +1699,11 @@ async fn run_user(
                     if let Some(result) = match dm_result {
                         Ok(v) => v,
                         Err(e) => {
-                            log::error!("[{mxid}] DM creation error: {e:#}");
+                            tracing::error!("[{mxid}] DM creation error: {e:#}");
                             None
                         }
                     } {
-                        log::info!("[{mxid}]   {result}");
+                        tracing::info!("[{mxid}]   {result}");
                         did_something = true;
                         break;
                     }
@@ -1739,32 +1739,32 @@ async fn run_user(
         }
     }
 
-    log::info!("[{mxid}] ✔ Main loop stopped");
+    tracing::info!("[{mxid}] ✔ Main loop stopped");
 
     // Signal the sync loop to stop (it shares the same stop_rx).
     sync_handle.abort();
     let _ = sync_handle.await;
-    log::info!("[{mxid}] ✔ Sync loop stopped");
+    tracing::info!("[{mxid}] ✔ Sync loop stopped");
 
     // ── 6. Wait for key backup to finish uploading ──────────────────────
-    log::info!("[{mxid}] ▶ Waiting for room key backup to complete …");
+    tracing::info!("[{mxid}] ▶ Waiting for room key backup to complete …");
     match client.encryption().backups().wait_for_steady_state().await {
         Ok(_) => {}
         Err(e) => {
-            log::error!("[{mxid}] ✘ Key backup wait failed: {e}");
+            tracing::error!("[{mxid}] ✘ Key backup wait failed: {e}");
         }
     }
-    log::info!("[{mxid}] ✔ Key backup upload complete");
+    tracing::info!("[{mxid}] ✔ Key backup upload complete");
 
     // ── 7. Log out ──────────────────────────────────────────────────────
-    log::info!("[{mxid}] ▶ Logging out …");
+    tracing::info!("[{mxid}] ▶ Logging out …");
     match client.matrix_auth().logout().await {
         Ok(_) => {}
         Err(e) => {
-            log::error!("[{mxid}] ✘ Logout failed: {e}");
+            tracing::error!("[{mxid}] ✘ Logout failed: {e}");
         }
     }
-    log::info!("[{mxid}] ✔ Logged out – all done!");
+    tracing::info!("[{mxid}] ✔ Logged out – all done!");
 
     RunUserOutcome::Shutdown
 }
