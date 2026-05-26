@@ -1937,34 +1937,6 @@ async fn try_create_dm(
 
     tracing::info!("DM creation started: {}", peer.as_str());
 
-    // Query the server directly for device keys (the local device list may
-    // be empty for users we don't share a room with yet).
-    let mut device_keys_request = get_keys::v3::Request::new();
-    device_keys_request
-        .device_keys
-        .insert(peer.to_owned(), vec![]);
-
-    match client.send(device_keys_request).await {
-        Ok(response) => {
-            let has_devices = response
-                .device_keys
-                .get(peer)
-                .is_some_and(|devices| !devices.is_empty());
-            if !has_devices {
-                tracing::info!("Skipped DM – no device_keys in /keys/query");
-                return Ok(Some(format!(
-                    "⏭ Skipped DM with {peer} (no device_keys in /keys/query)"
-                )));
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Skipped DM – failed /keys/query");
-            return Ok(Some(format!(
-                "⏭ Skipped DM with {peer} (failed /keys/query: {e})"
-            )));
-        }
-    }
-
     match client.create_dm(peer).await {
         Ok(room) => {
             tracing::info!(room_id = %room.room_id(), "Created DM");
