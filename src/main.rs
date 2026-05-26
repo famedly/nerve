@@ -1383,7 +1383,16 @@ async fn run_user(
 
     // Auto-accept invites from rooms whose server name matches the
     // configured ACCEPT_INVITE_DOMAINS patterns.
-    let invite_domains = config.accept_invite_domains;
+    //
+    // NOTE: We also retry pending invites in the main loop below, because
+    // over federation the receiving homeserver may briefly 403 a join that
+    // immediately follows the stripped-state invite event (the invite has
+    // been streamed to the client via sync, but the local server hasn't
+    // finished persisting it for the join endpoint).  Without that retry,
+    // a DM created across federation can stay in the "invited" state
+    // forever, and the invited user never sends in the room.
+    let invite_domains = config.accept_invite_domains.clone();
+    let invite_domains_for_main = config.accept_invite_domains.clone();
     client.add_event_handler(
         move |ev: StrippedRoomMemberEvent, room: Room, client: Client| {
             let invite_domains = invite_domains.clone();
@@ -1583,6 +1592,29 @@ async fn run_user(
             if promotion_counter > config.promotion_wait_cycles {
                 promoted = true;
                 tracing::info!("[{mxid}]   🔼 Promotion wait complete – will start sending");
+            }
+        }
+
+        // Retry any pending invites whose server name matches the
+        // configured ACCEPT_INVITE_DOMAINS patterns.  The event-handler
+        // above already attempts to join once when the invite arrives via
+        // sync, but over federation that first attempt can race the local
+        // server's invite persistence and fail with HTTP 403 M_FORBIDDEN.
+        // Retrying here on every main-loop tick lets the join succeed as
+        // soon as the local server is ready.
+        for invited in client.invited_rooms() {
+            let room_id = invited.room_id().to_owned();
+            if !room_id
+                .server_name()
+                .is_some_and(|s| matches_invite_domain(&invite_domains_for_main, s.as_str()))
+            {
+                continue;
+            }
+            match invited.join().await {
+                Ok(()) => tracing::info!("[{mxid}]   ✔ Joined pending invite {room_id}"),
+                Err(e) => {
+                    tracing::debug!("[{mxid}]   ⏳ Pending invite {room_id} not yet joinable: {e}")
+                }
             }
         }
 
