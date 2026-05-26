@@ -1735,7 +1735,7 @@ async fn run_user(
                             None
                         }
                     } {
-                        tracing::info!("[{mxid}]   {result}");
+                        tracing::info!("[{mxid}] DM creation success: {result}");
                         did_something = true;
                         break;
                     }
@@ -1934,6 +1934,8 @@ async fn try_create_dm(
 
     let peer = candidates[idx];
     tracing::Span::current().record("peer", peer.as_str());
+
+    tracing::info!("DM creation started: {}", peer.as_str());
 
     // Query the server directly for device keys (the local device list may
     // be empty for users we don't share a room with yet).
