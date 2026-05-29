@@ -1226,7 +1226,9 @@ async fn run_user(
             for room in invited {
                 match room.join().await {
                     Ok(()) => tracing::info!("[{mxid}]   ✔ Joined {}", room.room_id()),
-                    Err(e) => tracing::error!("[{mxid}]   ✘ Failed to join {}: {e}", room.room_id()),
+                    Err(e) => {
+                        tracing::error!("[{mxid}]   ✘ Failed to join {}: {e}", room.room_id())
+                    }
                 }
             }
             match client.sync_once(SyncSettings::default()).await {
@@ -1557,7 +1559,9 @@ async fn run_user(
             if joined_ids.contains(rid) {
                 true
             } else {
-                tracing::info!("[{mxid}]   🚪 Room {rid} is no longer joined, removing from tracking");
+                tracing::info!(
+                    "[{mxid}]   🚪 Room {rid} is no longer joined, removing from tracking"
+                );
                 false
             }
         });
