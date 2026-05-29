@@ -1,4 +1,5 @@
 mod auth;
+mod datapoint;
 mod image;
 mod registration;
 mod telemetry;
@@ -856,6 +857,12 @@ async fn main() -> anyhow::Result<()> {
     // the lock so the next restart can proceed.
     let restart_mutex: Arc<TokioMutex<()>> = Arc::new(TokioMutex::new(()));
 
+    // ── Datapoint submission ────────────────────────────────────────────
+    // Both are cheap to clone and no-ops when the corresponding env var
+    // is unset.
+    let account_list = Arc::new(datapoint::AccountList::from_env());
+    let datapoint_client = datapoint::DatapointClient::from_env();
+
     // ── Spawn one supervisor task per user (staggered) ──────────────────
     let mut handles = Vec::with_capacity(total_users);
     let mut stagger = Duration::ZERO;
@@ -867,6 +874,8 @@ async fn main() -> anyhow::Result<()> {
         let ready_count = ready_count.clone();
         let ready_tx = ready_tx.clone();
         let restart_mutex = restart_mutex.clone();
+        let account_list = account_list.clone();
+        let datapoint_client = datapoint_client.clone();
 
         let handle = tokio::spawn(async move {
             // ── Initial stagger ─────────────────────────────────────────
@@ -926,6 +935,8 @@ async fn main() -> anyhow::Result<()> {
                     ready_tx.clone(),
                     total_users,
                     login_notify.clone(),
+                    account_list.clone(),
+                    datapoint_client.clone(),
                 );
                 tokio::pin!(run_future);
 
@@ -1108,6 +1119,8 @@ async fn run_user(
     ready_tx: Arc<watch::Sender<bool>>,
     total_users: usize,
     login_notify: Arc<Notify>,
+    account_list: Arc<datapoint::AccountList>,
+    datapoint_client: datapoint::DatapointClient,
 ) -> RunUserOutcome {
     // RAII guard: when this function returns for *any* reason, decrement
     // the ready count (if it was incremented) and update the readiness
@@ -1290,10 +1303,17 @@ async fn run_user(
     // the image so it reflects true end-to-end latency.
     let live_serials_handler = live_serials.clone();
     let our_user_id_handler = our_user_id.clone();
+    let account_list_handler = account_list.clone();
+    let datapoint_client_handler = datapoint_client.clone();
+    // Pre-compute our receiver-side account number once; it does not change
+    // for the lifetime of this login.
+    let our_account = account_list.lookup(our_user_id.as_str());
     client.add_event_handler(
         move |ev: OriginalSyncRoomMessageEvent, room: Room, client: Client| {
             let live_serials = live_serials_handler.clone();
             let our_user_id = our_user_id_handler.clone();
+            let account_list = account_list_handler.clone();
+            let datapoint_client = datapoint_client_handler.clone();
             async move {
                 let room_name = room.name().unwrap_or_else(|| room.room_id().to_string());
                 // Extract the message body from text or image caption.
@@ -1351,6 +1371,19 @@ async fn run_user(
                         let valid = media_ok;
                         let ev_sender = &ev.sender;
                         let suffix = if valid { "" } else { ", INVALID" };
+
+                        // Submit a datapoint to the configured DATAPOINT_SERVER
+                        // (no-op when unset).  Delivery is recorded in
+                        // microseconds; the message body only carries
+                        // millisecond precision so we scale up.
+                        datapoint_client.send(datapoint::Datapoint::new(
+                            datapoint::now_micros(),
+                            account_list.lookup(ev_sender.as_str()),
+                            our_account,
+                            serial,
+                            delivery_ms.saturating_mul(1_000),
+                            media_size_bytes.unwrap_or(0),
+                        ));
 
                         tracing::info!(
                             delivery_ms,

@@ -20,6 +20,7 @@ jsonwebtoken = "9"
 mime = "0.3"
 flate2 = "1"
 rand = "0.9"
+zerocopy = { version = "0.8", features = ["derive"] }
 
 # crates for OTLP support
 opentelemetry = { version = "0.31.0" }

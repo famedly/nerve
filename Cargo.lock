@@ -2190,6 +2190,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "zerocopy",
 ]
 
 [[package]]
