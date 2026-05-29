@@ -9,8 +9,12 @@ COPY . .
 RUN cargo build --release --target $(uname -m)-unknown-linux-musl && \
     strip -o nerve target/$(uname -m)-unknown-linux-musl/release/nerve
 
+RUN cargo build --release --target $(uname -m)-unknown-linux-musl -p datapoint && \
+    strip -o datapoint target/$(uname -m)-unknown-linux-musl/release/datapoint
+
 FROM scratch AS nerve
 
 COPY --from=builder /build/nerve /nerve
+COPY --from=builder /build/datapoint /datapoint
 
 ENTRYPOINT ["/nerve"]

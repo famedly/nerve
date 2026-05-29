@@ -30,3 +30,6 @@ opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
 tracing-opentelemetry = { version = "0.32.0" }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 tracing = "0.1.40"
+
+[workspace]
+members = ["datapoint"]
