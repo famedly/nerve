@@ -1375,13 +1375,18 @@ async fn run_user(
                         // Submit a datapoint to the configured DATAPOINT_SERVER
                         // (no-op when unset).  Delivery is recorded in
                         // microseconds; the message body only carries
-                        // millisecond precision so we scale up.
+                        // millisecond precision so we scale up.  Received
+                        // messages must always report a non-zero delivery time
+                        // (a zero value marks *sent* messages) so we clamp to a
+                        // minimum of 1µs, which also covers clock skew that
+                        // would otherwise saturate the difference to 0.
+                        let delivery_us = delivery_ms.saturating_mul(1_000).max(1);
                         datapoint_client.send(datapoint::Datapoint::new(
                             datapoint::now_micros(),
                             account_list.lookup(ev_sender.as_str()),
                             our_account,
                             serial,
-                            delivery_ms.saturating_mul(1_000),
+                            delivery_us,
                             media_size_bytes.unwrap_or(0),
                         ));
 
@@ -1755,6 +1760,9 @@ async fn run_user(
                         &send_candidates,
                         &mut send_rr,
                         config.media_probability,
+                        &datapoint_client,
+                        &account_list,
+                        our_account,
                     )
                     .await
                     {
@@ -1896,6 +1904,9 @@ async fn try_send(
     candidates: &[OwnedRoomId],
     rr: &mut usize,
     media_probability: f64,
+    datapoint_client: &datapoint::DatapointClient,
+    account_list: &datapoint::AccountList,
+    our_account: u32,
 ) -> Option<String> {
     if candidates.is_empty() {
         return None;
@@ -1919,8 +1930,42 @@ async fn try_send(
     span.record("serial", serial);
     span.record("kind", kind);
 
-    let result = if send_media {
-        let png_data = image::generate_png();
+    // When the room is a DM (exactly one recipient besides us), record that
+    // recipient as the datapoint receiver; otherwise leave it as `0`
+    // (unknown) since a room may have many recipients.
+    let targets = state.room.direct_targets();
+    let receiver = if targets.len() == 1 {
+        targets
+            .iter()
+            .next()
+            .map(|t| account_list.lookup(&t.to_string()))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    // For media we know the payload size up front; generate it before
+    // recording the datapoint so the size is available either way.
+    let png_data = if send_media {
+        Some(image::generate_png())
+    } else {
+        None
+    };
+    let media_size_bytes = png_data.as_ref().map(|d| d.len() as u64).unwrap_or(0);
+
+    // Mark the *intent* to send as a datapoint, before actually sending.  A
+    // zero delivery time marks the record as *sent* (as opposed to
+    // *received*, which always reports a non-zero delivery time).
+    datapoint_client.send(datapoint::Datapoint::new(
+        datapoint::now_micros(),
+        our_account,
+        receiver,
+        serial,
+        0,
+        media_size_bytes,
+    ));
+
+    let result = if let Some(png_data) = png_data {
         let config = AttachmentConfig::new()
             .info(AttachmentInfo::Image(BaseImageInfo {
                 width: Some(UInt::new(image::IMAGE_WIDTH as u64).unwrap()),
