@@ -1155,8 +1155,18 @@ async fn run_user(
     let client = match Client::builder()
         .homeserver_url(homeserver_url)
         .with_encryption_settings(EncryptionSettings {
-            auto_enable_cross_signing: true,
-            auto_enable_backups: true,
+            // Cross-signing keys and the backup must only ever be created by
+            // the primary (first) device for an account. If every device
+            // auto-created them, two devices starting at the same time would
+            // each bootstrap their own cross-signing identity / backup; the
+            // last upload wins on the server, but the *primary's* private
+            // keys are the ones stored in secret storage, so a later import
+            // fails with "the public key of the imported private key doesn't
+            // match the public key that was uploaded to the server". We
+            // therefore disable auto-creation and drive it explicitly from
+            // the primary device below.
+            auto_enable_cross_signing: false,
+            auto_enable_backups: false,
             ..Default::default()
         })
         .build()
@@ -1261,6 +1271,22 @@ async fn run_user(
         }
     }
 
+    // Decide whether *this* device is the primary (first) device for the
+    // account. Only the primary creates the cross-signing identity, the
+    // backup and the secret storage; every other device waits for the
+    // primary and then imports the secrets. This is what prevents the
+    // concurrent-bootstrap race described where the EncryptionSettings are
+    // configured above.
+    let account_password = config.auth.account_password(&mxid);
+    let stale_device_timeout = Duration::from_secs(config.stale_device_timeout);
+    let we_are_primary = is_first_device(
+        &client,
+        stale_device_timeout,
+        account_password.as_deref(),
+        username,
+    )
+    .await;
+
     // Enable recovery or import existing secrets.
     let recovery = client.encryption().recovery();
 
@@ -1273,7 +1299,20 @@ async fn run_user(
             }
             tracing::info!("[{mxid}] ✔ Existing recovery secrets imported");
         }
-        _ => {
+        _ if we_are_primary => {
+            // Primary device on a not-yet-provisioned account: create the
+            // cross-signing identity (auto-creation is disabled, so we are
+            // the only one doing this) and then enable recovery, which also
+            // creates the backup and stores every secret in secret storage.
+            tracing::info!("[{mxid}] ▶ Primary device – bootstrapping cross-signing …");
+            if let Err(e) = client
+                .encryption()
+                .bootstrap_cross_signing_if_needed(None)
+                .await
+            {
+                return RunUserOutcome::Failed(RunUserError::other(e.into()));
+            }
+
             tracing::info!("[{mxid}] ▶ Enabling recovery …");
             match recovery
                 .enable()
@@ -1285,6 +1324,66 @@ async fn run_user(
                 Err(e) => return RunUserOutcome::Failed(RunUserError::other(e.into())),
             }
             tracing::info!("[{mxid}] ✔ E2EE recovery enabled (passphrase-protected)");
+        }
+        _ => {
+            // Secondary device on an account whose primary hasn't finished
+            // setting up recovery yet. We must NOT bootstrap anything
+            // ourselves; instead we wait for the primary to publish the
+            // secrets and then import them.
+            tracing::info!(
+                "[{mxid}] ⏳ Not primary – waiting for the primary device to enable recovery …"
+            );
+
+            const WAIT_STEP: Duration = Duration::from_secs(2);
+            const MAX_WAIT: Duration = Duration::from_secs(120);
+            let mut waited = Duration::ZERO;
+            loop {
+                if *stop_rx.borrow() {
+                    return RunUserOutcome::Shutdown;
+                }
+
+                match client.sync_once(SyncSettings::default()).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        if is_fatal_sync_status(&e) {
+                            tracing::error!(
+                                server_reachability = false,
+                                error = %e,
+                                "[{mxid}] ✘ Sync fatal error while waiting for recovery",
+                            );
+                            return RunUserOutcome::Failed(RunUserError::Fatal(e.into()));
+                        }
+                        return RunUserOutcome::Failed(RunUserError::other(e.into()));
+                    }
+                }
+
+                if matches!(
+                    recovery.state(),
+                    RecoveryState::Enabled | RecoveryState::Incomplete
+                ) {
+                    break;
+                }
+
+                if waited >= MAX_WAIT {
+                    return RunUserOutcome::Failed(RunUserError::other(anyhow::anyhow!(
+                        "timed out waiting for the primary device to enable recovery"
+                    )));
+                }
+
+                let mut stop = stop_rx.clone();
+                tokio::select! {
+                    _ = sleep(WAIT_STEP) => {}
+                    _ = stop.changed() => return RunUserOutcome::Shutdown,
+                }
+                waited += WAIT_STEP;
+            }
+
+            tracing::info!("[{mxid}] ▶ Recovery available – importing secrets …");
+            match recovery.recover(&recovery_passphrase).await {
+                Ok(_) => {}
+                Err(e) => return RunUserOutcome::Failed(RunUserError::other(e.into())),
+            }
+            tracing::info!("[{mxid}] ✔ Existing recovery secrets imported");
         }
     }
 
@@ -1523,9 +1622,8 @@ async fn run_user(
     // Track whether we are the primary (first) device for this account.
     // When we first become the first device we wait `promotion_wait_cycles`
     // main-loop ticks before actually sending, so that other devices have a
-    // chance to appear.
-    let account_password = config.auth.account_password(&mxid);
-    let stale_device_timeout = Duration::from_secs(config.stale_device_timeout);
+    // chance to appear. `account_password` and `stale_device_timeout` were
+    // computed during the E2EE setup above and are reused here.
     let mut we_are_first = is_first_device(
         &client,
         stale_device_timeout,
