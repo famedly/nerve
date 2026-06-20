@@ -4,7 +4,7 @@ set -u
 FILE=/tmp/datapoint_test.bin
 rm -f "$FILE"
 
-./target/release/datapoint serve 4 127.0.0.1:19000 "$FILE" &
+DATAPOINT_STRIDE=4 ./target/release/datapoint serve 127.0.0.1:19000 "$FILE" &
 SERVER=$!
 sleep 0.2
 
@@ -21,8 +21,15 @@ echo "--- cat output (hex) ---"
 echo "--- size ---"
 stat -c%s "$FILE"
 
+echo "--- cat range 1..3 (hex, expect 8 bytes) ---"
+DATAPOINT_STRIDE=4 ./target/release/datapoint cat 1..3 "$FILE" | xxd
+echo "--- cat range 1.. (hex) ---"
+DATAPOINT_STRIDE=4 ./target/release/datapoint cat 1.. "$FILE" | xxd
+echo "--- cat range ..2 (hex, expect 8 bytes) ---"
+DATAPOINT_STRIDE=4 ./target/release/datapoint cat ..2 "$FILE" | xxd
+
 echo "--- stride mismatch test (expect connection drop, file size unchanged) ---"
-./target/release/datapoint serve 4 127.0.0.1:19001 "$FILE.mismatch" &
+DATAPOINT_STRIDE=4 ./target/release/datapoint serve 127.0.0.1:19001 "$FILE.mismatch" &
 SERVER=$!
 sleep 0.2
 rm -f "$FILE.mismatch"

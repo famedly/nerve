@@ -1,5 +1,8 @@
 //! Datapoint server.
 //!
+//! The stride (datapoint size in bytes) is configured through the
+//! `DATAPOINT_STRIDE` environment variable (1..=256, 0 means 256).
+//!
 //! TCP protocol:
 //!   - Client sends a single header byte: the stride size in bytes
 //!     (0x00 is interpreted as 256).
@@ -17,7 +20,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -27,6 +30,7 @@ use mio::{Events, Interest, Poll, Token};
 
 const LISTENER: Token = Token(0);
 const DEFAULT_ADDR: &str = "0.0.0.0:9000";
+const STRIDE_ENV: &str = "DATAPOINT_STRIDE";
 const READ_BUF_SIZE: usize = 64 * 1024;
 const EVENT_CAPACITY: usize = 1024;
 
@@ -36,10 +40,11 @@ fn default_file_path() -> PathBuf {
 
 fn print_usage(prog: &str) {
     eprintln!("Usage:");
-    eprintln!("  {prog} serve <stride> [addr] [file]");
-    eprintln!("  {prog} cat [file]");
+    eprintln!("  {prog} serve [addr] [file]");
+    eprintln!("  {prog} cat [range] [file]");
     eprintln!();
-    eprintln!("  stride  1..=256 byte size of one datapoint (0 means 256)");
+    eprintln!("  stride  read from the {STRIDE_ENV} env var, 1..=256 (0 means 256)");
+    eprintln!("  range   Rust-like datapoint range, end-exclusive: 1..3, 1.., ..3, ..");
     eprintln!("  addr    listen address, default {DEFAULT_ADDR}");
     eprintln!(
         "  file    temp file path, default {}",
@@ -59,7 +64,7 @@ fn main() -> ExitCode {
 
     let rest = &args[1..];
     let result = match cmd.as_str() {
-        "serve" => run_serve(&prog, rest),
+        "serve" => run_serve(rest),
         "cat" => run_cat(rest),
         "-h" | "--help" | "help" => {
             print_usage(&prog);
@@ -81,21 +86,16 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_serve(prog: &str, args: &[String]) -> io::Result<()> {
-    let Some(stride_arg) = args.first() else {
-        print_usage(prog);
-        return Err(io::Error::new(ErrorKind::InvalidInput, "missing <stride>"));
-    };
-
-    let stride = parse_stride(stride_arg)?;
+fn run_serve(args: &[String]) -> io::Result<()> {
+    let stride = stride_from_env()?;
     let addr: SocketAddr = args
-        .get(1)
+        .first()
         .map(String::as_str)
         .unwrap_or(DEFAULT_ADDR)
         .parse()
         .map_err(|e| io::Error::new(ErrorKind::InvalidInput, format!("invalid addr: {e}")))?;
     let file_path = args
-        .get(2)
+        .get(1)
         .map(PathBuf::from)
         .unwrap_or_else(default_file_path);
 
@@ -103,15 +103,50 @@ fn run_serve(prog: &str, args: &[String]) -> io::Result<()> {
 }
 
 fn run_cat(args: &[String]) -> io::Result<()> {
-    let file_path = args
-        .first()
-        .map(PathBuf::from)
-        .unwrap_or_else(default_file_path);
-    cat(&file_path)
+    // cat [range] [file]: the range argument is recognized by the
+    // presence of ".."; everything else is treated as the file path.
+    let mut range: Option<DataRange> = None;
+    let mut file_path: Option<PathBuf> = None;
+
+    for arg in args {
+        if arg.contains("..") {
+            if range.is_some() {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "at most one range may be given",
+                ));
+            }
+            range = Some(parse_range(arg)?);
+        } else if file_path.is_none() {
+            file_path = Some(PathBuf::from(arg));
+        } else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("unexpected extra argument: {arg}"),
+            ));
+        }
+    }
+
+    let file_path = file_path.unwrap_or_else(default_file_path);
+    match range {
+        Some(range) => cat_range(&file_path, stride_from_env()?, &range),
+        None => cat(&file_path),
+    }
+}
+
+fn stride_from_env() -> io::Result<usize> {
+    let s = env::var(STRIDE_ENV).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("{STRIDE_ENV} env var must be set (1..=256, 0 means 256)"),
+        )
+    })?;
+    parse_stride(&s)
 }
 
 fn parse_stride(s: &str) -> io::Result<usize> {
     let n: u16 = s
+        .trim()
         .parse()
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "stride must be 0..=256"))?;
     match n {
@@ -124,11 +159,70 @@ fn parse_stride(s: &str) -> io::Result<usize> {
     }
 }
 
+/// A half-open range of datapoint indices, mirroring Rust's range
+/// syntax (`start..end`, `start..`, `..end`, `..`). `end` is
+/// exclusive, so `1..3` selects datapoints 1 and 2.
+struct DataRange {
+    start: usize,
+    end: Option<usize>,
+}
+
+fn parse_range(s: &str) -> io::Result<DataRange> {
+    let Some((lhs, rhs)) = s.split_once("..") else {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "range must contain '..'",
+        ));
+    };
+
+    let parse_idx = |part: &str| -> io::Result<usize> {
+        part.trim()
+            .parse()
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "range bound must be a number"))
+    };
+
+    let start = if lhs.is_empty() { 0 } else { parse_idx(lhs)? };
+    let end = if rhs.is_empty() {
+        None
+    } else {
+        Some(parse_idx(rhs)?)
+    };
+
+    if let Some(end) = end
+        && end < start
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "range end must not be smaller than start",
+        ));
+    }
+
+    Ok(DataRange { start, end })
+}
+
 fn cat(path: &Path) -> io::Result<()> {
     let mut f = File::open(path)?;
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     io::copy(&mut f, &mut stdout)?;
+    stdout.flush()
+}
+
+fn cat_range(path: &Path, stride: usize, range: &DataRange) -> io::Result<()> {
+    let mut f = File::open(path)?;
+    f.seek(SeekFrom::Start((range.start * stride) as u64))?;
+
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    match range.end {
+        Some(end) => {
+            let bytes = end.saturating_sub(range.start) * stride;
+            io::copy(&mut f.take(bytes as u64), &mut stdout)?;
+        }
+        None => {
+            io::copy(&mut f, &mut stdout)?;
+        }
+    }
     stdout.flush()
 }
 
