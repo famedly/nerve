@@ -67,13 +67,10 @@ enum Distance {
 
 impl Distance {
     /// Derive the distance from two MXIDs (`@user:server`).
-    fn from_mxids(our_user_id: &str, sender_user_id: &str) -> Self {
+    fn from_mxids(our_user_id: &UserId, sender_user_id: &UserId) -> Self {
         if our_user_id == sender_user_id {
-            return Self::SameUser;
-        }
-        let our_server = our_user_id.rsplit_once(':').map(|(_, s)| s);
-        let their_server = sender_user_id.rsplit_once(':').map(|(_, s)| s);
-        if our_server.is_some() && our_server == their_server {
+            Self::SameUser
+        } else if our_user_id.server_name() == sender_user_id.server_name() {
             Self::SameServer
         } else {
             Self::Federated
@@ -1465,8 +1462,7 @@ async fn run_user(
 
                         let delivery_ms = now_millis().saturating_sub(send_ts);
                         let kind = if is_media { "media" } else { "text" };
-                        let distance =
-                            Distance::from_mxids(our_user_id.as_str(), ev.sender.as_str());
+                        let distance = Distance::from_mxids(&our_user_id, &ev.sender);
                         let valid = media_ok;
                         let ev_sender = &ev.sender;
                         let suffix = if valid { "" } else { ", INVALID" };
