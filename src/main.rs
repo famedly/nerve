@@ -27,7 +27,7 @@ use matrix_sdk::{
     room::MessagesOptions,
     ruma::{
         OwnedDeviceId, OwnedRoomId, OwnedUserId, UInt, UserId,
-        api::client::{keys::get_keys, uiaa},
+        api::client::uiaa,
         events::{
             AnySyncMessageLikeEvent, AnySyncTimelineEvent,
             room::{
