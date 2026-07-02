@@ -104,11 +104,6 @@ type LiveSerials = Arc<TokioMutex<HashMap<(OwnedRoomId, OwnedUserId), u64>>>;
 #[derive(Debug, Clone)]
 struct UserSpec {
     mxid: OwnedUserId,
-    /// Homeserver URL derived from the server part of the MXID
-    /// (always `https://<server>`).
-    homeserver_url: String,
-    /// The `localpart` of the MXID (everything between `@` and `:`).
-    username: String,
     /// Peers this user should create DMs with.
     peers: Vec<OwnedUserId>,
 }
@@ -133,11 +128,6 @@ impl FromStr for UserSpec {
             .map_err(|e| format!("Invalid MXID in USERS: {mxid_str:?}: {e}"))?
             .to_owned();
 
-        // Derive homeserver URL and username from the MXID.
-        let server_name = mxid.server_name().as_str().to_owned();
-        let homeserver_url = format!("https://{server_name}");
-        let username = mxid.localpart().to_owned();
-
         let peers: Vec<OwnedUserId> = mxids
             .map(|s| {
                 <&UserId>::try_from(s)
@@ -148,12 +138,7 @@ impl FromStr for UserSpec {
             })
             .collect::<Result<_, String>>()?;
 
-        Ok(UserSpec {
-            mxid,
-            homeserver_url,
-            username,
-            peers,
-        })
+        Ok(UserSpec { mxid, peers })
     }
 }
 
@@ -366,6 +351,10 @@ struct Config {
     /// first-device election.
     #[arg(long, env = "STALE_DEVICE_TIMEOUT", default_value_t = 300)]
     stale_device_timeout: u64,
+
+    ///Connect to the homeserver via HTTP instead of HTTPS.
+    #[arg(long, env = "INSECURE_SERVER")]
+    insecure_server: bool,
 }
 
 // ── Small helpers ───────────────────────────────────────────────────────
@@ -1105,7 +1094,7 @@ fn update_readiness(count: &AtomicUsize, total: usize, tx: &watch::Sender<bool>)
     skip_all,
     fields(
         server_name = user.mxid.server_name().as_str(),
-        username = user.username.as_str(),
+        username = user.mxid.localpart(),
     )
 )]
 async fn run_user(
@@ -1144,13 +1133,21 @@ async fn run_user(
     };
 
     let mxid = user.mxid.as_str().to_owned();
-    let homeserver_url = &user.homeserver_url;
-    let username = &user.username;
+    let homeserver_url = format!(
+        "{}://{}",
+        if config.insecure_server {
+            "http"
+        } else {
+            "https"
+        },
+        user.mxid.server_name().as_str()
+    );
+    let username = user.mxid.localpart();
     let peers = &user.peers;
 
     // ── 1 & 2. Register (if applicable) and log in ─────────────────────
     let client = match Client::builder()
-        .homeserver_url(homeserver_url)
+        .homeserver_url(&homeserver_url)
         .with_encryption_settings(EncryptionSettings {
             // Cross-signing keys and the backup must only ever be created by
             // the primary (first) device for an account. If every device
@@ -1181,7 +1178,7 @@ async fn run_user(
         .auth
         .login(
             &client,
-            homeserver_url,
+            &homeserver_url,
             server_name,
             username,
             &mxid,

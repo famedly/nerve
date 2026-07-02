@@ -132,6 +132,10 @@
         "nixpkgs": [
           "famedly-engineering-standards",
           "nixpkgs"
+        ],
+        "rust-overlay": [
+          "famedly-engineering-standards",
+          "rust-overlay"
         ]
       }
     },
