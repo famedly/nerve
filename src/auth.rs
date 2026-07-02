@@ -3,7 +3,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{EncodingKey, Header};
-use matrix_sdk::{Client, encryption::vodozemac::base64_encode, ruma::serde::JsonObject};
+use matrix_sdk::{
+    Client,
+    encryption::vodozemac::base64_encode,
+    ruma::{
+        api::client::{account::register, error::ErrorKind, uiaa},
+        serde::JsonObject,
+    },
+};
 use serde_json::json;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -13,22 +20,29 @@ use crate::registration;
 #[derive(Parser, Clone)]
 pub struct AuthConfig {
     /// Synapse shared registration secret (uses admin API + password login).
-    #[arg(long, env = "SHARED_REGISTRATION_SECRET", requires = "password_secret", required = true, conflicts_with_all = ["sta_secret", "sta_seed"])]
+    #[arg(long, env = "SHARED_REGISTRATION_SECRET", requires = "password_secret", required = true, conflicts_with_all = ["sta_secret", "sta_seed", "open_registration"])]
     shared_registration_secret: Option<String>,
 
     /// Secret from which per-user login passwords are derived.
-    #[arg(long, env = "PASSWORD_SECRET", requires = "shared_registration_secret")]
+    #[arg(long, env = "PASSWORD_SECRET")]
     password_secret: Option<String>,
 
     /// STA JWT secret (uses com.famedly.login.token login).
-    #[arg(long, env = "STA_SECRET", conflicts_with_all = ["shared_registration_secret", "password_secret", "sta_seed"])]
+    #[arg(long, env = "STA_SECRET", conflicts_with_all = ["shared_registration_secret", "password_secret", "sta_seed", "open_registration"])]
     sta_secret: Option<String>,
 
     /// STA seed from which per-server STA secrets are derived.
     /// The STA secret is computed as `SHA-256(seed || hostname)` where
     /// `hostname` is the first DNS label of the server name from the MXID.
-    #[arg(long, env = "STA_SEED", conflicts_with_all = ["shared_registration_secret", "password_secret", "sta_secret"])]
+    #[arg(long, env = "STA_SEED", conflicts_with_all = ["shared_registration_secret", "password_secret", "sta_secret", "open_registration"])]
     sta_seed: Option<String>,
+
+    /// Register via the standard Matrix `/register` endpoint without any
+    /// additional authorization (requires open registration on the
+    /// homeserver). If the account already exists, falls back to a password
+    /// login.
+    #[arg(long, env = "OPEN_REGISTRATION", requires = "password_secret", conflicts_with_all = ["shared_registration_secret", "sta_secret", "sta_seed"])]
+    open_registration: bool,
 
     /// Secret from which per-user E2EE recovery passphrases are derived.
     #[arg(long, env = "RECOVERY_SECRET")]
@@ -129,6 +143,79 @@ impl AuthConfig {
                 .initial_device_display_name(initial_device_display_name)
                 .send()
                 .await?;
+        } else if self.open_registration {
+            let password_secret = self.password_secret.as_ref().unwrap();
+            let account_password = derive_secret(password_secret, mxid);
+
+            tracing::info!(
+                server_name,
+                username,
+                "[{mxid}] ▶ Registering on {homeserver_url} (open registration) …",
+            );
+
+            let auth = client.matrix_auth();
+
+            let mut request = register::v3::Request::new();
+            request.username = Some(username.to_owned());
+            request.password = Some(account_password.clone());
+            request.initial_device_display_name = Some(initial_device_display_name.to_owned());
+
+            let mut reg_result = auth.register(request.clone()).await;
+
+            // Complete UIAA with the dummy stage if the server asks for it.
+            if let Err(e) = &reg_result {
+                if let Some(uiaa_info) = e.as_uiaa_response() {
+                    let mut dummy = uiaa::Dummy::new();
+                    dummy.session = uiaa_info.session.clone();
+                    request.auth = Some(uiaa::AuthData::Dummy(dummy));
+                    reg_result = auth.register(request).await;
+                }
+            }
+
+            match reg_result {
+                Ok(_) => {
+                    tracing::info!(
+                        server_name,
+                        username,
+                        server_reachability = true,
+                        "[{mxid}] ✔ Registered",
+                    );
+                }
+                // The account already exists – fine, just log in below.
+                Err(e) if matches!(e.client_api_error_kind(), Some(ErrorKind::UserInUse)) => {
+                    tracing::info!(
+                        server_name,
+                        username,
+                        server_reachability = true,
+                        "[{mxid}] ✔ Already registered",
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        server_name,
+                        username,
+                        server_reachability = false,
+                        error = %e,
+                        "[{mxid}] ✘ Registration failed",
+                    );
+                    return Err(e.into());
+                }
+            }
+
+            // A successful registration already stored the session from the
+            // returned access token; a password login is only needed when the
+            // account existed before.
+            if !auth.logged_in() {
+                tracing::info!(
+                    server_name,
+                    username,
+                    "[{mxid}] ▶ Logging in with password …",
+                );
+                auth.login_username(username, &account_password)
+                    .initial_device_display_name(initial_device_display_name)
+                    .send()
+                    .await?;
+            }
         } else if let Some(sta_secret) = self.resolve_sta_secret(server_name) {
             tracing::info!(
                 server_name,
