@@ -1,9 +1,15 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
+use anyhow::Context;
 use clap::Parser;
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{EncodingKey, Header};
 use matrix_sdk::{Client, encryption::vodozemac::base64_encode, ruma::serde::JsonObject};
+use reqwest::Url;
+use serde::Deserialize;
 use serde_json::json;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -13,7 +19,7 @@ use crate::registration;
 #[derive(Parser, Clone)]
 pub struct AuthConfig {
     /// Synapse shared registration secret (uses admin API + password login).
-    #[arg(long, env = "SHARED_REGISTRATION_SECRET", requires = "password_secret", required = true, conflicts_with_all = ["sta_secret", "sta_seed"])]
+    #[arg(long, env = "SHARED_REGISTRATION_SECRET", requires = "password_secret", required = true, conflicts_with_all = ["sta_secret", "sta_seed", "fuss_url"])]
     shared_registration_secret: Option<String>,
 
     /// Secret from which per-user login passwords are derived.
@@ -21,14 +27,30 @@ pub struct AuthConfig {
     password_secret: Option<String>,
 
     /// STA JWT secret (uses com.famedly.login.token login).
-    #[arg(long, env = "STA_SECRET", conflicts_with_all = ["shared_registration_secret", "password_secret", "sta_seed"])]
+    #[arg(long, env = "STA_SECRET", conflicts_with_all = ["shared_registration_secret", "password_secret", "sta_seed", "fuss_url"])]
     sta_secret: Option<String>,
 
     /// STA seed from which per-server STA secrets are derived.
     /// The STA secret is computed as `SHA-256(seed || hostname)` where
     /// `hostname` is the first DNS label of the server name from the MXID.
-    #[arg(long, env = "STA_SEED", conflicts_with_all = ["shared_registration_secret", "password_secret", "sta_secret"])]
+    #[arg(long, env = "STA_SEED", conflicts_with_all = ["shared_registration_secret", "password_secret", "sta_secret", "fuss_url"])]
     sta_seed: Option<String>,
+
+    /// Base URL of fuss (Fake User and Session Service). Matrix tokens are
+    /// requested from its token API and used for the STA
+    /// `com.famedly.login.token.oauth` login.
+    #[arg(long, env = "FUSS_URL", conflicts_with_all = ["shared_registration_secret", "password_secret", "sta_secret", "sta_seed"])]
+    fuss_url: Option<Url>,
+
+    /// File containing the Kubernetes service account token (with the
+    /// audience fuss expects) that authenticates requests to fuss' token API.
+    /// Read again for every login, as projected tokens are rotated.
+    #[arg(
+        long,
+        env = "FUSS_SERVICE_ACCOUNT_TOKEN_FILE",
+        default_value = "/var/run/secrets/fuss/token"
+    )]
+    fuss_service_account_token_file: PathBuf,
 
     /// Secret from which per-user E2EE recovery passphrases are derived.
     #[arg(long, env = "RECOVERY_SECRET")]
@@ -129,24 +151,64 @@ impl AuthConfig {
                 .initial_device_display_name(initial_device_display_name)
                 .send()
                 .await?;
-        } else if let Some(sta_secret) = self.resolve_sta_secret(server_name) {
-            tracing::info!(
-                server_name,
-                username,
-                "[{mxid}] ▶ Logging in via STA (JWT) …",
-            );
+        } else {
+            let (login_type, token) = if let Some(sta_secret) = self.resolve_sta_secret(server_name)
+            {
+                tracing::info!(
+                    server_name,
+                    username,
+                    "[{mxid}] ▶ Logging in via STA (JWT) …",
+                );
 
-            let exp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                + 3600;
-            let token = jsonwebtoken::encode(
-                &Header::new(jsonwebtoken::Algorithm::HS512),
-                &json!({ "sub": username, "exp": exp }),
-                &EncodingKey::from_secret(sta_secret.as_bytes()),
-            )
-            .map_err(|e| anyhow::anyhow!("failed to encode JWT: {e}"))?;
+                let exp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600;
+                let token = jsonwebtoken::encode(
+                    &Header::new(jsonwebtoken::Algorithm::HS512),
+                    &json!({ "sub": username, "exp": exp }),
+                    &EncodingKey::from_secret(sta_secret.as_bytes()),
+                )
+                .map_err(|e| anyhow::anyhow!("failed to encode JWT: {e}"))?;
+
+                ("com.famedly.login.token", token)
+            } else if let Some(fuss_url) = &self.fuss_url {
+                tracing::info!(
+                    server_name,
+                    username,
+                    "[{mxid}] ▶ Requesting token from fuss at {fuss_url} …",
+                );
+
+                let token = match fetch_fuss_token(
+                    fuss_url,
+                    &self.fuss_service_account_token_file,
+                    username,
+                )
+                .await
+                {
+                    Ok(token) => token,
+                    Err(e) => {
+                        tracing::error!(
+                            server_name,
+                            username,
+                            error = %format!("{e:#}"),
+                            "[{mxid}] ✘ Requesting token from fuss failed",
+                        );
+                        return Err(e);
+                    }
+                };
+
+                tracing::info!(
+                    server_name,
+                    username,
+                    "[{mxid}] ▶ Logging in via STA (fuss token) …",
+                );
+
+                ("com.famedly.login.token.oauth", token)
+            } else {
+                panic!("violated clap requirements");
+            };
 
             let mut data = JsonObject::new();
             data.insert(
@@ -157,7 +219,7 @@ impl AuthConfig {
 
             let builder = client
                 .matrix_auth()
-                .login_custom("com.famedly.login.token", data)?
+                .login_custom(login_type, data)?
                 .initial_device_display_name(initial_device_display_name);
 
             let login_result = builder.send().await;
@@ -182,12 +244,72 @@ impl AuthConfig {
                 }
             }
             login_result?;
-        } else {
-            panic!("violated clap requirements");
         }
 
         Ok(())
     }
+}
+
+// ── fuss ────────────────────────────────────────────────────────────────
+
+/// Successful response of fuss' `POST /v1/users/{user}/token` (only the
+/// fields we care about).
+#[derive(Deserialize)]
+struct FussTokenResponse {
+    access_token: String,
+}
+
+/// Error response of the fuss API.
+#[derive(Deserialize)]
+struct FussError {
+    error: String,
+    message: String,
+}
+
+/// Request a Matrix token for `username` (the SCIM user ID in fuss, which
+/// equals the localpart) from fuss' token API, authenticated with the
+/// Kubernetes service account token in `service_account_token_file`.
+async fn fetch_fuss_token(
+    fuss_url: &Url,
+    service_account_token_file: &Path,
+    username: &str,
+) -> anyhow::Result<String> {
+    let service_account_token =
+        std::fs::read_to_string(service_account_token_file).with_context(|| {
+            format!(
+                "failed to read service account token from {}",
+                service_account_token_file.display()
+            )
+        })?;
+
+    let mut url = fuss_url.clone();
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("FUSS_URL {fuss_url} cannot be a base URL"))?
+        .pop_if_empty()
+        .extend(["v1", "users", username, "token"]);
+
+    let resp = reqwest::Client::new()
+        .post(url.clone())
+        .bearer_auth(service_account_token.trim())
+        .send()
+        .await
+        .with_context(|| format!("fuss token request to {url} failed"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let detail = match serde_json::from_str::<FussError>(&body) {
+            Ok(err) => format!("{}: {}", err.error, err.message),
+            Err(_) => body,
+        };
+        anyhow::bail!("fuss token request to {url} failed ({status}): {detail}");
+    }
+
+    let token: FussTokenResponse = resp
+        .json()
+        .await
+        .context("failed to decode fuss token response")?;
+    Ok(token.access_token)
 }
 
 // ── Small helpers ───────────────────────────────────────────────────────
