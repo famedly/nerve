@@ -2,88 +2,152 @@
 //!
 //! When the `DATAPOINT_SERVER` env var is set (to a `host:port` endpoint),
 //! a background tokio task keeps a persistent TCP connection to the
-//! collector and forwards [`Datapoint`] records as fixed-size
-//! [`STRIDE`]-byte writes.  See the `datapoint` sub-crate for the
-//! server-side protocol; in short, the first byte is the stride and the
-//! remainder is a stream of back-to-back records.
+//! collector and forwards [`Datapoint`] records using the datapoint TCP
+//! write protocol.
 //!
-//! `ACCOUNT_LIST` provides a stable MXID → 1-based account-number
-//! mapping that turns user IDs into the compact `sender` / `receiver`
-//! fields of each datapoint.  It accepts either a space-delimited list
-//! of MXIDs or a path to a file with one MXID per line.
+//! On every (re)connect three types are defined:
+//!
+//! | slot | type        | definition                                    |
+//! |------|-------------|-----------------------------------------------|
+//! | 1    | `Domain`    | `text str` (referenceable, `u16` references)  |
+//! | 2    | `Localpart` | `text str` (referenceable, `u16` references)  |
+//! | 3    | `Message`   | see [`MESSAGE_DEFINITION`]                    |
+//!
+//! MXIDs are split into localpart and domain; each distinct string is
+//! submitted once per connection and afterwards referenced by its
+//! connection-local index.  The server never replies; it closes the
+//! connection on any protocol error.
 
 use std::collections::HashMap;
 use std::env;
-use std::fs;
-use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use zerocopy::IntoBytes;
-use zerocopy::byteorder::little_endian::{U32, U64};
+use zerocopy::byteorder::little_endian::{U16, U32, U64};
+use zerocopy::{Immutable, IntoBytes};
 
-/// Size of one record on the wire.  Sent verbatim as the stride header
-/// byte on connect.
-pub const STRIDE: usize = 32;
+const DOMAIN_SLOT: u8 = 1;
+const LOCALPART_SLOT: u8 = 2;
+const MESSAGE_SLOT: u8 = 3;
 
-/// One datapoint as it appears on the wire.
-///
-/// All integers are little-endian, regardless of host byte order, so the
-/// captured stream is portable between architectures.
-#[derive(Debug, Clone, Copy, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+/// Index byte `2`: references to the type are 2 bytes wide, little-endian.
+const REFERENCE_INDEX_BYTE: u8 = 2;
+/// Index byte `0`: not referenceable.
+const PLAIN_INDEX_BYTE: u8 = 0;
+
+/// Maximum number of values per connection for a type with 2-byte references.
+const MAX_REFERENCEABLE: usize = 1 << 16;
+
+/// Definition of the `Message` type.  Scalars are sent little-endian.
+const MESSAGE_DEFINITION: &str = "timestamp_us u64,serial u64,delivery_us u32,media_size u32,\
+                                  sender_name Localpart,sender_domain Domain,\
+                                  receiver_name Localpart,receiver_domain Domain";
+
+/// The messages that define all types: `00 <index byte> <Name>\0 <definition>\0`.
+fn type_definitions() -> Vec<u8> {
+    let mut msg = Vec::new();
+    for (index_byte, name, definition) in [
+        (REFERENCE_INDEX_BYTE, "Domain", "text str"),
+        (REFERENCE_INDEX_BYTE, "Localpart", "text str"),
+        (PLAIN_INDEX_BYTE, "Message", MESSAGE_DEFINITION),
+    ] {
+        msg.extend_from_slice(&[0x00, index_byte]);
+        msg.extend_from_slice(name.as_bytes());
+        msg.push(0);
+        msg.extend_from_slice(definition.as_bytes());
+        msg.push(0);
+    }
+    msg
+}
+
+/// A `Message` value as it appears on the wire, including the leading slot
+/// byte.  Field order and widths must match [`MESSAGE_DEFINITION`]; the
+/// reference fields are local indices of `Localpart` / `Domain` values
+/// (index byte `2` = `u16`, little-endian).
+#[derive(Debug, Clone, Copy, IntoBytes, Immutable)]
 #[repr(C)]
+struct MessageWire {
+    slot: u8,
+    timestamp_us: U64,
+    serial: U64,
+    delivery_us: U32,
+    media_size: U32,
+    sender_name: U16,
+    sender_domain: U16,
+    receiver_name: U16,
+    receiver_domain: U16,
+}
+
+/// One datapoint.
+#[derive(Debug, Clone)]
 pub struct Datapoint {
     /// UNIX timestamp at the moment the datapoint is generated, in
     /// microseconds.
-    pub timestamp_us: U64,
-    /// 1-based account number of the sender.  `0` when the MXID is not
-    /// in the configured `ACCOUNT_LIST`.
-    pub sender: U32,
-    /// 1-based account number of the receiver.  `0` when the MXID is not
-    /// in the configured `ACCOUNT_LIST`.
-    pub receiver: U32,
+    timestamp_us: u64,
     /// Per-(room, sender) message serial number.
-    pub serial: U64,
+    serial: u64,
     /// End-to-end delivery time in microseconds, clamped to `u32::MAX`.
-    pub delivery_us: U32,
+    /// `0` marks a *sent* message.
+    delivery_us: u32,
     /// Media size in bytes (0 for plain text messages), clamped to
     /// `u32::MAX`.
-    pub media_size: U32,
+    media_size: u32,
+    sender: Mxid,
+    receiver: Mxid,
 }
-
-// Compile-time check: the struct must be exactly `STRIDE` bytes with no
-// padding so the receiver can reinterpret records directly.
-const _: () = assert!(std::mem::size_of::<Datapoint>() == STRIDE);
 
 impl Datapoint {
     /// Build a datapoint, clamping any out-of-range field to its maximum.
+    /// `receiver` is `None` when unknown (e.g. a room with many recipients);
+    /// it is then submitted as an empty localpart and domain.
     pub fn new(
         timestamp_us: u64,
-        sender: u32,
-        receiver: u32,
+        sender: &str,
+        receiver: Option<&str>,
         serial: u64,
         delivery_us: u64,
         media_size: u64,
     ) -> Self {
         Self {
-            timestamp_us: U64::new(timestamp_us),
-            sender: U32::new(sender),
-            receiver: U32::new(receiver),
-            serial: U64::new(serial),
-            delivery_us: U32::new(clamp_u32(delivery_us)),
-            media_size: U32::new(clamp_u32(media_size)),
+            timestamp_us,
+            serial,
+            delivery_us: clamp_u32(delivery_us),
+            media_size: clamp_u32(media_size),
+            sender: Mxid::parse(sender),
+            receiver: receiver.map(Mxid::parse).unwrap_or_default(),
         }
+    }
+
+    /// Append the encoded value (including the new `Domain` / `Localpart`
+    /// values it needs and the leading slot bytes) to `out`.  Returns `false`
+    /// when the session ran out of reference indices; `out` is then garbage
+    /// and the session must be discarded.
+    fn encode(&self, session: &mut Session, out: &mut Vec<u8>) -> bool {
+        let wire = (|| {
+            Some(MessageWire {
+                slot: MESSAGE_SLOT,
+                timestamp_us: U64::new(self.timestamp_us),
+                serial: U64::new(self.serial),
+                delivery_us: U32::new(self.delivery_us),
+                media_size: U32::new(self.media_size),
+                sender_name: U16::new(session.localparts.intern(&self.sender.localpart, out)?),
+                sender_domain: U16::new(session.domains.intern(&self.sender.domain, out)?),
+                receiver_name: U16::new(session.localparts.intern(&self.receiver.localpart, out)?),
+                receiver_domain: U16::new(session.domains.intern(&self.receiver.domain, out)?),
+            })
+        })();
+        let Some(wire) = wire else {
+            return false;
+        };
+        out.extend_from_slice(wire.as_bytes());
+        true
     }
 }
 
 fn clamp_u32(value: u64) -> u32 {
-    if value > u32::MAX as u64 {
-        u32::MAX
-    } else {
-        value as u32
-    }
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// Current UNIX timestamp with microsecond resolution.
@@ -94,65 +158,79 @@ pub fn now_micros() -> u64 {
         .unwrap_or(0)
 }
 
-// ── Account list ────────────────────────────────────────────────────────
+// ── MXID splitting ──────────────────────────────────────────────────────
 
-/// MXID → 1-based account number.  Look-ups for MXIDs not in the list
-/// return `0`.
-///
-/// Loaded from the `ACCOUNT_LIST` env var, which is interpreted as:
-///   * a path to a file containing one MXID per line if it resolves to
-///     an existing file, otherwise
-///   * a space-delimited list of MXIDs.
-#[derive(Debug, Default, Clone)]
-pub struct AccountList {
-    map: HashMap<String, u32>,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Mxid {
+    localpart: String,
+    domain: String,
 }
 
-impl AccountList {
-    /// Build an [`AccountList`] from the `ACCOUNT_LIST` env var.  An
-    /// unset or empty variable yields an empty list (every MXID maps to
-    /// account `0`).
-    pub fn from_env() -> Self {
-        match env::var("ACCOUNT_LIST") {
-            Ok(raw) => Self::parse(&raw),
-            Err(_) => Self::default(),
+impl Mxid {
+    /// Split `@localpart:domain`.  The domain may itself contain a colon
+    /// (port).  Input that does not look like an MXID ends up entirely in the
+    /// localpart.  NUL bytes are dropped as they would terminate the string
+    /// on the wire.
+    fn parse(mxid: &str) -> Self {
+        let mxid = mxid.strip_prefix('@').unwrap_or(mxid);
+        let (localpart, domain) = mxid.split_once(':').unwrap_or((mxid, ""));
+        Self {
+            localpart: localpart.replace('\0', ""),
+            domain: domain.replace('\0', ""),
+        }
+    }
+}
+
+// ── Per-connection state ────────────────────────────────────────────────
+
+/// Maps strings to their connection-local index for one referenceable type.
+struct Interner {
+    slot: u8,
+    map: HashMap<String, u16>,
+    /// Number of values submitted on this connection (= next local index).
+    count: usize,
+}
+
+impl Interner {
+    fn new(slot: u8) -> Self {
+        Self {
+            slot,
+            map: HashMap::new(),
+            count: 0,
         }
     }
 
-    fn parse(raw: &str) -> Self {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Self::default();
+    /// Local index of `value`, appending the value to `out` if it has not
+    /// been submitted on this connection yet.  `None` when out of indices.
+    fn intern(&mut self, value: &str, out: &mut Vec<u8>) -> Option<u16> {
+        if let Some(&index) = self.map.get(value) {
+            return Some(index);
         }
-
-        let mxids: Vec<String> = if trimmed.starts_with("@") {
-            trimmed.split_whitespace().map(str::to_owned).collect()
-        } else {
-            match fs::read_to_string(trimmed) {
-                Ok(content) => content
-                    .lines()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .collect(),
-                Err(e) => {
-                    tracing::warn!("ACCOUNT_LIST file {trimmed:?} unreadable: {e}");
-                    return Self::default();
-                }
-            }
-        };
-
-        let map = mxids
-            .into_iter()
-            .enumerate()
-            .map(|(i, mxid)| (mxid, (i + 1) as u32))
-            .collect();
-        Self { map }
+        if self.count >= MAX_REFERENCEABLE {
+            return None;
+        }
+        let index = self.count as u16;
+        self.count += 1;
+        out.push(self.slot);
+        out.extend_from_slice(value.as_bytes());
+        out.push(0);
+        self.map.insert(value.to_owned(), index);
+        Some(index)
     }
+}
 
-    /// Returns the 1-based account number for `mxid`, or `0` when unknown.
-    pub fn lookup(&self, mxid: &str) -> u32 {
-        self.map.get(mxid).copied().unwrap_or(0)
+/// Everything the server knows about one connection.
+struct Session {
+    domains: Interner,
+    localparts: Interner,
+}
+
+impl Session {
+    fn new() -> Self {
+        Self {
+            domains: Interner::new(DOMAIN_SLOT),
+            localparts: Interner::new(LOCALPART_SLOT),
+        }
     }
 }
 
@@ -196,13 +274,18 @@ impl DatapointClient {
 }
 
 /// Background task: maintains a TCP connection, reconnecting on any
-/// failure, and forwards every received [`Datapoint`] as a single
-/// [`STRIDE`]-byte write.
+/// failure.  Each connection starts with the type definitions; every
+/// received [`Datapoint`] is then written as a single buffer containing any
+/// new `Domain` / `Localpart` values followed by the `Message`.
 async fn run_loop(endpoint: String, mut rx: mpsc::UnboundedReceiver<Datapoint>) {
     tracing::info!("datapoint client → {endpoint}");
 
+    // A datapoint that could not be encoded because the session ran out of
+    // reference indices; it is re-encoded on the next connection.
+    let mut carry: Option<Datapoint> = None;
+
     loop {
-        let mut stream = match TcpStream::connect(&endpoint).await {
+        let stream = match TcpStream::connect(&endpoint).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("datapoint connect to {endpoint} failed: {e}");
@@ -210,23 +293,139 @@ async fn run_loop(endpoint: String, mut rx: mpsc::UnboundedReceiver<Datapoint>) 
                 continue;
             }
         };
+        let (mut reader, mut writer) = stream.into_split();
 
-        // Stride header: one byte (0 means 256; we use STRIDE == 32).
-        if let Err(e) = stream.write_all(&[STRIDE as u8]).await {
-            tracing::warn!("datapoint header write to {endpoint} failed: {e}");
+        if let Err(e) = writer.write_all(&type_definitions()).await {
+            tracing::warn!("datapoint type definition write to {endpoint} failed: {e}");
             tokio::time::sleep(RECONNECT_DELAY).await;
             continue;
         }
 
+        let mut session = Session::new();
+        let mut buf = Vec::new();
+        let mut discard = [0u8; 1];
         loop {
-            let Some(dp) = rx.recv().await else {
-                // All senders dropped – shut the worker down.
-                return;
+            let dp = match carry.take() {
+                Some(dp) => dp,
+                None => tokio::select! {
+                    dp = rx.recv() => match dp {
+                        Some(dp) => dp,
+                        // All senders dropped – shut the worker down.
+                        None => return,
+                    },
+                    // The server never sends anything; a read completing
+                    // means it closed the connection (which it does on any
+                    // protocol error).
+                    r = reader.read(&mut discard) => {
+                        match r {
+                            Ok(0) => tracing::warn!(
+                                "datapoint server {endpoint} closed the connection – reconnecting"
+                            ),
+                            Ok(_) => continue,
+                            Err(e) => tracing::warn!(
+                                "datapoint read from {endpoint} failed: {e} – reconnecting"
+                            ),
+                        }
+                        tokio::time::sleep(RECONNECT_DELAY).await;
+                        break;
+                    }
+                },
             };
-            if let Err(e) = stream.write_all(dp.as_bytes()).await {
+
+            buf.clear();
+            if !dp.encode(&mut session, &mut buf) {
+                // Out of local indices: start over on a fresh connection
+                // (which resets the indices) without delay.
+                tracing::info!("datapoint reference indices exhausted – reconnecting");
+                carry = Some(dp);
+                break;
+            }
+            if let Err(e) = writer.write_all(&buf).await {
                 tracing::warn!("datapoint write to {endpoint} failed: {e} – reconnecting");
+                tokio::time::sleep(RECONNECT_DELAY).await;
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn type_definition_wire_format() {
+        assert_eq!(
+            type_definitions(),
+            b"\x00\x02Domain\0text str\0\
+              \x00\x02Localpart\0text str\0\
+              \x00\x00Message\0timestamp_us u64,serial u64,delivery_us u32,media_size u32,\
+              sender_name Localpart,sender_domain Domain,\
+              receiver_name Localpart,receiver_domain Domain\0"
+        );
+    }
+
+    #[test]
+    fn mxid_parsing() {
+        assert_eq!(
+            Mxid::parse("@alice:example.org:8448"),
+            Mxid {
+                localpart: "alice".into(),
+                domain: "example.org:8448".into()
+            }
+        );
+        assert_eq!(Mxid::parse("weird").domain, "");
+    }
+
+    #[test]
+    fn encoding_interns_per_session() {
+        let mut session = Session::new();
+        let dp = Datapoint::new(1, "@alice:example.org", Some("@bob:example.org"), 4, 5, 6);
+
+        let mut out = Vec::new();
+        assert!(dp.encode(&mut session, &mut out));
+
+        let expected = [
+            &b"\x02alice\0"[..],  // Localpart 0
+            b"\x01example.org\0", // Domain 0
+            b"\x02bob\0",         // Localpart 1
+            &[MESSAGE_SLOT],
+            &1u64.to_le_bytes(),
+            &4u64.to_le_bytes(),
+            &5u32.to_le_bytes(),
+            &6u32.to_le_bytes(),
+            &[0, 0, 0, 0, 1, 0, 0, 0], // sender 0/0, receiver 1/0
+        ]
+        .concat();
+        assert_eq!(out, expected);
+
+        // Same peers again: only the message is emitted; unknown receiver
+        // interns the empty strings.
+        let dp = Datapoint::new(2, "@bob:example.org", None, 7, 0, 0);
+        out.clear();
+        assert!(dp.encode(&mut session, &mut out));
+        let expected = [
+            &b"\x02\0"[..], // Localpart 2 = ""
+            b"\x01\0",      // Domain 1 = ""
+            &[MESSAGE_SLOT],
+            &2u64.to_le_bytes(),
+            &7u64.to_le_bytes(),
+            &0u32.to_le_bytes(),
+            &0u32.to_le_bytes(),
+            &[1, 0, 0, 0, 2, 0, 1, 0], // sender 1/0, receiver 2/1
+        ]
+        .concat();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn indices_exhaust() {
+        let mut interner = Interner::new(1);
+        let mut out = Vec::new();
+        for i in 0..MAX_REFERENCEABLE {
+            assert_eq!(interner.intern(&i.to_string(), &mut out), Some(i as u16));
+        }
+        assert_eq!(interner.intern("one more", &mut out), None);
+        assert_eq!(interner.intern("0", &mut out), Some(0));
     }
 }

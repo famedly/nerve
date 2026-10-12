@@ -855,9 +855,7 @@ async fn main() -> anyhow::Result<()> {
     let restart_mutex: Arc<TokioMutex<()>> = Arc::new(TokioMutex::new(()));
 
     // ── Datapoint submission ────────────────────────────────────────────
-    // Both are cheap to clone and no-ops when the corresponding env var
-    // is unset.
-    let account_list = Arc::new(datapoint::AccountList::from_env());
+    // Cheap to clone and a no-op when `DATAPOINT_SERVER` is unset.
     let datapoint_client = datapoint::DatapointClient::from_env();
 
     // ── Spawn one supervisor task per user (staggered) ──────────────────
@@ -871,7 +869,6 @@ async fn main() -> anyhow::Result<()> {
         let ready_count = ready_count.clone();
         let ready_tx = ready_tx.clone();
         let restart_mutex = restart_mutex.clone();
-        let account_list = account_list.clone();
         let datapoint_client = datapoint_client.clone();
 
         let handle = tokio::spawn(async move {
@@ -932,7 +929,6 @@ async fn main() -> anyhow::Result<()> {
                     ready_tx.clone(),
                     total_users,
                     login_notify.clone(),
-                    account_list.clone(),
                     datapoint_client.clone(),
                 );
                 tokio::pin!(run_future);
@@ -1116,7 +1112,6 @@ async fn run_user(
     ready_tx: Arc<watch::Sender<bool>>,
     total_users: usize,
     login_notify: Arc<Notify>,
-    account_list: Arc<datapoint::AccountList>,
     datapoint_client: datapoint::DatapointClient,
 ) -> RunUserOutcome {
     // RAII guard: when this function returns for *any* reason, decrement
@@ -1404,16 +1399,11 @@ async fn run_user(
     // the image so it reflects true end-to-end latency.
     let live_serials_handler = live_serials.clone();
     let our_user_id_handler = our_user_id.clone();
-    let account_list_handler = account_list.clone();
     let datapoint_client_handler = datapoint_client.clone();
-    // Pre-compute our receiver-side account number once; it does not change
-    // for the lifetime of this login.
-    let our_account = account_list.lookup(our_user_id.as_str());
     client.add_event_handler(
         move |ev: OriginalSyncRoomMessageEvent, room: Room, client: Client| {
             let live_serials = live_serials_handler.clone();
             let our_user_id = our_user_id_handler.clone();
-            let account_list = account_list_handler.clone();
             let datapoint_client = datapoint_client_handler.clone();
             async move {
                 let room_name = room.name().unwrap_or_else(|| room.room_id().to_string());
@@ -1483,8 +1473,8 @@ async fn run_user(
                         let delivery_us = delivery_ms.saturating_mul(1_000).max(1);
                         datapoint_client.send(datapoint::Datapoint::new(
                             datapoint::now_micros(),
-                            account_list.lookup(ev_sender.as_str()),
-                            our_account,
+                            ev_sender.as_str(),
+                            Some(our_user_id.as_str()),
                             serial,
                             delivery_us,
                             media_size_bytes.unwrap_or(0),
@@ -1860,8 +1850,7 @@ async fn run_user(
                         &mut send_rr,
                         config.media_probability,
                         &datapoint_client,
-                        &account_list,
-                        our_account,
+                        our_user_id.as_str(),
                     )
                     .await
                     {
@@ -2004,8 +1993,7 @@ async fn try_send(
     rr: &mut usize,
     media_probability: f64,
     datapoint_client: &datapoint::DatapointClient,
-    account_list: &datapoint::AccountList,
-    our_account: u32,
+    our_user_id: &str,
 ) -> Option<String> {
     if candidates.is_empty() {
         return None;
@@ -2030,17 +2018,13 @@ async fn try_send(
     span.record("kind", kind);
 
     // When the room is a DM (exactly one recipient besides us), record that
-    // recipient as the datapoint receiver; otherwise leave it as `0`
-    // (unknown) since a room may have many recipients.
+    // recipient as the datapoint receiver; otherwise leave it unknown since
+    // a room may have many recipients.
     let targets = state.room.direct_targets();
     let receiver = if targets.len() == 1 {
-        targets
-            .iter()
-            .next()
-            .map(|t| account_list.lookup(&t.to_string()))
-            .unwrap_or(0)
+        targets.iter().next().map(|t| t.to_string())
     } else {
-        0
+        None
     };
 
     // For media we know the payload size up front; generate it before
@@ -2057,8 +2041,8 @@ async fn try_send(
     // *received*, which always reports a non-zero delivery time).
     datapoint_client.send(datapoint::Datapoint::new(
         datapoint::now_micros(),
-        our_account,
-        receiver,
+        our_user_id,
+        receiver.as_deref(),
         serial,
         0,
         media_size_bytes,
