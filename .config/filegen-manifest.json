@@ -1,0 +1,38 @@
+{
+  "clobber-by-default": null,
+  "files": [
+    {
+      "clobber": true,
+      "deactivate": null,
+      "ignore-modification": null,
+      "source": "/nix/store/9gygg2wc1p2jfaqb890ic59lb4d7m4qi-pre-commit-config.yaml",
+      "target": "./.pre-commit-config.yaml",
+      "type": "copy"
+    },
+    {
+      "clobber": true,
+      "deactivate": null,
+      "ignore-modification": null,
+      "source": "/nix/store/lai6c0kl9c0r0j1ld4j8ilrw53k3bxmq-rust-test.yml",
+      "target": "./.github/workflows/rust-test.yml",
+      "type": "copy"
+    },
+    {
+      "clobber": true,
+      "deactivate": null,
+      "ignore-modification": null,
+      "source": "/nix/store/glxwjx24212kdvwwwpzcqkhdzck96cvi-envrc",
+      "target": "./.envrc",
+      "type": "copy"
+    },
+    {
+      "clobber": true,
+      "deactivate": null,
+      "ignore-modification": null,
+      "source": "/nix/store/ygwpnx793xkc2b7fna28hsh78mgph78h-envrc",
+      "target": "./.envrc",
+      "type": "copy"
+    }
+  ],
+  "version": 3
+}
