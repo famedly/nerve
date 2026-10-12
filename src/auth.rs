@@ -84,8 +84,10 @@ pub struct AuthConfig {
     fuss_service_account_token_file: PathBuf,
 
     /// Secret from which per-user E2EE recovery passphrases are derived.
-    #[arg(long, env = "RECOVERY_SECRET")]
-    recovery_secret: String,
+    /// Optional with fuss: if unset, the `security_phrase` suggested by fuss'
+    /// token API is used instead.
+    #[arg(long, env = "RECOVERY_SECRET", required_unless_present = "fuss_url")]
+    recovery_secret: Option<String>,
 }
 
 impl AuthConfig {
@@ -97,9 +99,11 @@ impl AuthConfig {
     }
 
     /// Derive a deterministic E2EE recovery passphrase from the shared secret
-    /// and an MXID.
-    pub fn recovery_passphrase(&self, mxid: &str) -> String {
-        derive_secret(&self.recovery_secret, mxid)
+    /// and an MXID. `None` if `RECOVERY_SECRET` is unset (fuss only).
+    pub fn recovery_passphrase(&self, mxid: &str) -> Option<String> {
+        self.recovery_secret
+            .as_ref()
+            .map(|secret| derive_secret(secret, mxid))
     }
 
     /// Resolve the STA secret, either directly from `STA_SECRET` or by
@@ -138,6 +142,9 @@ impl AuthConfig {
     }
 
     /// Register (if applicable) and log in to the homeserver.
+    ///
+    /// Returns the user's E2EE recovery passphrase: derived from
+    /// `RECOVERY_SECRET` if set, otherwise the `security_phrase` from fuss.
     #[tracing::instrument(skip_all, fields(mxid, server_name, username))]
     pub async fn login(
         &self,
@@ -147,7 +154,9 @@ impl AuthConfig {
         username: &str,
         mxid: &str,
         initial_device_display_name: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<String> {
+        let mut recovery_passphrase = self.recovery_passphrase(mxid);
+
         if let Some(shared_registration_secret) = &self.shared_registration_secret {
             let password_secret = self.password_secret.as_ref().unwrap();
             let account_password = derive_secret(password_secret, mxid);
@@ -207,7 +216,7 @@ impl AuthConfig {
                 "[{mxid}] ▶ Requesting token from fuss at {fuss_url} …",
             );
 
-            let token =
+            let mut token =
                 match fetch_fuss_token(fuss_url, &self.fuss_service_account_token_file, username)
                     .await
                 {
@@ -222,6 +231,20 @@ impl AuthConfig {
                         return Err(e);
                     }
                 };
+
+            // Checked before logging in, so no device is created in vain.
+            if recovery_passphrase.is_none() {
+                let security_phrase = token
+                    .security_phrase
+                    .take()
+                    .context("RECOVERY_SECRET is unset and fuss returned no security_phrase")?;
+                tracing::info!(
+                    server_name,
+                    username,
+                    "[{mxid}] Using the security phrase from fuss for E2EE recovery",
+                );
+                recovery_passphrase = Some(security_phrase);
+            }
 
             match self.fuss_mode {
                 FussMode::Sta => {
@@ -305,7 +328,7 @@ impl AuthConfig {
             panic!("violated clap requirements");
         }
 
-        Ok(())
+        Ok(recovery_passphrase.expect("clap requires RECOVERY_SECRET unless FUSS_URL is set"))
     }
 }
 
@@ -661,6 +684,9 @@ async fn json_response<T: serde::de::DeserializeOwned>(
 struct FussTokenResponse {
     access_token: String,
     device_id: String,
+    /// Suggested E2EE recovery passphrase for the user. Used if
+    /// `RECOVERY_SECRET` is unset.
+    security_phrase: Option<String>,
 }
 
 /// Error response of the fuss API.

@@ -799,7 +799,7 @@ async fn main() -> anyhow::Result<()> {
                         .resolve_sta_secret(u.mxid.server_name().as_str())
                 })
                 .unwrap_or_default();
-            let recovery_passphrase = config.auth.recovery_passphrase(mxid);
+            let recovery_passphrase = config.auth.recovery_passphrase(mxid).unwrap_or_default();
             let peers_str: Vec<&str> = u.peers.iter().map(|p| p.as_str()).collect();
             println!(
                 "{mxid} {account_password} {recovery_passphrase} peers=[{}]",
@@ -1181,7 +1181,7 @@ async fn run_user(
     assert_eq!(initial_name.len(), 11);
 
     let server_name = user.mxid.server_name().as_str();
-    if let Err(e) = config
+    let recovery_passphrase = match config
         .auth
         .login(
             &client,
@@ -1193,20 +1193,21 @@ async fn run_user(
         )
         .await
     {
-        // Registration 404 → the admin API is unreachable; treat as fatal.
-        if e.downcast_ref::<RegistrationError>()
-            .is_some_and(|reg_err| reg_err.status.is_some_and(|s| s.as_u16() == 404))
-        {
-            return RunUserOutcome::Failed(RunUserError::Fatal(e));
+        Ok(recovery_passphrase) => recovery_passphrase,
+        Err(e) => {
+            // Registration 404 → the admin API is unreachable; treat as fatal.
+            if e.downcast_ref::<RegistrationError>()
+                .is_some_and(|reg_err| reg_err.status.is_some_and(|s| s.as_u16() == 404))
+            {
+                return RunUserOutcome::Failed(RunUserError::Fatal(e));
+            }
+            return RunUserOutcome::Failed(RunUserError::other(e));
         }
-        return RunUserOutcome::Failed(RunUserError::other(e));
-    }
+    };
 
     // Login succeeded – notify the supervisor so restart staggering can
     // proceed.
     login_notify.notify_one();
-
-    let recovery_passphrase = config.auth.recovery_passphrase(&mxid);
 
     let our_user_id = client
         .user_id()
