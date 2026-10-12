@@ -1149,7 +1149,11 @@ async fn run_user(
     let peers = &user.peers;
 
     // ── 1 & 2. Register (if applicable) and log in ─────────────────────
-    let client = match Client::builder()
+    let mut client_builder = Client::builder();
+    if config.auth.refreshes_tokens() {
+        client_builder = client_builder.handle_refresh_tokens();
+    }
+    let client = match client_builder
         .homeserver_url(homeserver_url)
         .with_encryption_settings(EncryptionSettings {
             // Cross-signing keys and the backup must only ever be created by
@@ -1929,10 +1933,10 @@ async fn run_user(
 
     // ── 7. Log out ──────────────────────────────────────────────────────
     tracing::info!("[{mxid}] ▶ Logging out …");
-    match client.matrix_auth().logout().await {
-        Ok(_) => {}
+    match config.auth.logout(&client).await {
+        Ok(()) => {}
         Err(e) => {
-            tracing::error!("[{mxid}] ✘ Logout failed: {e}");
+            tracing::error!("[{mxid}] ✘ Logout failed: {e:#}");
         }
     }
     tracing::info!("[{mxid}] ✔ Logged out – all done!");

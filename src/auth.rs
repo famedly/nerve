@@ -9,12 +9,16 @@ use hmac::{Hmac, Mac};
 use jsonwebtoken::{EncodingKey, Header};
 use matrix_sdk::{
     Client, SessionMeta, SessionTokens,
-    authentication::matrix::MatrixSession,
+    authentication::{
+        matrix::MatrixSession,
+        oauth::{ClientId, OAuthSession, UserSession},
+    },
     encryption::vodozemac::base64_encode,
     ruma::{OwnedDeviceId, UserId, serde::JsonObject},
     store::RoomLoadSettings,
 };
-use reqwest::Url;
+use rand::Rng;
+use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use serde_json::json;
 use sha1::Sha1;
@@ -30,6 +34,10 @@ pub enum FussMode {
     Sta,
     /// the token is the access token.
     Native,
+    /// The homeserver delegates authentication to an OAuth 2.0 authorization
+    /// server that brokers fuss as its upstream IdP: the fuss token is
+    /// exchanged there for a session of its own, with a fresh device.
+    Broker,
 }
 
 #[derive(Parser, Clone)]
@@ -59,7 +67,9 @@ pub struct AuthConfig {
 
     /// How fuss tokens are used: `sta` logs in to Synapse with
     /// `com.famedly.login.token.oauth`, `native` uses them directly as
-    /// access tokens.
+    /// access tokens, `broker` exchanges them for a session at the
+    /// homeserver's OAuth 2.0 authorization server, whose upstream IdP is
+    /// fuss.
     #[arg(long, env = "FUSS_MODE", value_enum, default_value_t = FussMode::Sta)]
     fuss_mode: FussMode,
 
@@ -107,6 +117,24 @@ impl AuthConfig {
             return Some(derive_sta_secret(seed, hostname));
         }
         None
+    }
+
+    /// Whether sessions come with refresh tokens, so the client has to be
+    /// built with `ClientBuilder::handle_refresh_tokens()`.
+    pub fn refreshes_tokens(&self) -> bool {
+        self.fuss_url.is_some() && self.fuss_mode == FussMode::Broker
+    }
+
+    /// End the session: revoke it at the OAuth 2.0 authorization server if it
+    /// is one of its sessions, log out through the Matrix API otherwise.
+    pub async fn logout(&self, client: &Client) -> anyhow::Result<()> {
+        match client.oauth().full_session() {
+            Some(session) => revoke_oauth_session(client, session).await,
+            None => {
+                client.matrix_auth().logout().await?;
+                Ok(())
+            }
+        }
     }
 
     /// Register (if applicable) and log in to the homeserver.
@@ -215,6 +243,33 @@ impl AuthConfig {
                 }
                 FussMode::Native => {
                     restore_fuss_session(client, token, server_name, username, mxid).await?;
+                }
+                FussMode::Broker => {
+                    let result = broker_login(
+                        client,
+                        homeserver_url,
+                        token.access_token,
+                        server_name,
+                        username,
+                        mxid,
+                    )
+                    .await;
+                    match &result {
+                        Ok(()) => tracing::info!(
+                            server_name,
+                            username,
+                            server_reachability = true,
+                            "[{mxid}] ✔ Brokered login succeeded",
+                        ),
+                        Err(e) => tracing::error!(
+                            server_name,
+                            username,
+                            server_reachability = false,
+                            error = %format!("{e:#}"),
+                            "[{mxid}] ✘ Brokered login failed",
+                        ),
+                    }
+                    result?;
                 }
             }
         } else if let Some(sta_secret) = self.resolve_sta_secret(server_name) {
@@ -385,6 +440,219 @@ async fn restore_fuss_session(
     whoami_result
 }
 
+// ── Brokered OAuth 2.0 login ────────────────────────────────────────────
+
+/// The OAuth 2.0 client ID nerve presents to the authorization server. The
+/// authorization server is expected to accept it without registration.
+const BROKER_CLIENT_ID: &str = "nerve";
+
+/// The redirect URI of the authorization request. Never visited: the
+/// authorization code is returned by the upstream login callback directly.
+const BROKER_REDIRECT_URI: &str = "http://localhost/";
+
+/// How long to wait for the homeserver to learn about a new session.
+const BROKER_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Response of the authorization server's upstream login callback.
+#[derive(Deserialize)]
+struct BrokerLoginResponse {
+    code: String,
+}
+
+/// Successful response of the token endpoint (only the fields we care about).
+#[derive(Deserialize)]
+struct OAuthTokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+}
+
+/// Log in at an OAuth 2.0 authorization server that brokers fuss as its
+/// upstream IdP, as its login page would after fuss redirected back to it:
+///
+/// 1. Discover the authorization server through the homeserver's
+///    `auth_metadata`.
+/// 2. `POST <issuer>/login` with the fuss token as `id_token` and the
+///    authorization request (with a PKCE challenge and a fresh device ID in
+///    its scope) as `state`. The authorization server checks the token
+///    against fuss' keys, creates a session, and returns an authorization
+///    code.
+/// 3. Exchange the code at the token endpoint (authorization code grant).
+/// 4. Wait until the homeserver knows the new session, then use it.
+///
+/// Every login creates a new device, as device IDs must not be reused.
+async fn broker_login(
+    client: &Client,
+    homeserver_url: &str,
+    fuss_token: String,
+    server_name: &str,
+    username: &str,
+    mxid: &str,
+) -> anyhow::Result<()> {
+    let user_id = <&UserId>::try_from(mxid)
+        .with_context(|| format!("invalid MXID {mxid:?}"))?
+        .to_owned();
+
+    let metadata = client
+        .oauth()
+        .server_metadata()
+        .await
+        .context("failed to discover the homeserver's OAuth 2.0 authorization server")?;
+
+    let device_id = OwnedDeviceId::from(format!("NERVE{}", random_uppercase_alphanumeric(10)));
+    let scope = format!("openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}");
+    let verifier = base64url_encode(rand::rng().random::<[u8; 32]>());
+    let challenge = base64url_encode(Sha256::digest(verifier.as_bytes()));
+    let authorization_request = json!({
+        "response_type": "code",
+        "client_id": BROKER_CLIENT_ID,
+        "redirect_uri": BROKER_REDIRECT_URI,
+        "scope": scope,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    });
+    let state = base64url_encode(authorization_request.to_string());
+
+    tracing::info!(
+        server_name,
+        username,
+        device_id = device_id.as_str(),
+        "[{mxid}] ▶ Exchanging fuss token at {} for device {device_id} …",
+        metadata.issuer,
+    );
+
+    let http = reqwest::Client::new();
+
+    let login_url = metadata
+        .issuer
+        .join("login")
+        .with_context(|| format!("invalid issuer {}", metadata.issuer))?;
+    let resp = http
+        .post(login_url.clone())
+        .form(&[
+            ("id_token", fuss_token.as_str()),
+            // Only meaningful for real upstream IdPs.
+            ("access_token", "unused"),
+            ("state", state.as_str()),
+        ])
+        .send()
+        .await
+        .with_context(|| format!("login request to {login_url} failed"))?;
+    let BrokerLoginResponse { code } = json_response(resp, &login_url).await?;
+
+    let token_url = metadata.token_endpoint.clone();
+    let resp = http
+        .post(token_url.clone())
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", BROKER_REDIRECT_URI),
+            ("client_id", BROKER_CLIENT_ID),
+            ("code_verifier", verifier.as_str()),
+        ])
+        .send()
+        .await
+        .with_context(|| format!("token request to {token_url} failed"))?;
+    let tokens: OAuthTokenResponse = json_response(resp, &token_url).await?;
+
+    wait_for_session(homeserver_url, &tokens.access_token, mxid).await?;
+
+    client
+        .oauth()
+        .restore_session(
+            OAuthSession {
+                client_id: ClientId::new(BROKER_CLIENT_ID.to_owned()),
+                user: UserSession {
+                    meta: SessionMeta { user_id, device_id },
+                    tokens: SessionTokens {
+                        access_token: tokens.access_token,
+                        refresh_token: tokens.refresh_token,
+                    },
+                },
+            },
+            RoomLoadSettings::default(),
+        )
+        .await?;
+
+    Ok(())
+}
+
+/// Wait until the homeserver accepts a new access token. The homeserver learns
+/// about sessions from the authorization server asynchronously, so it rejects
+/// the token as unknown until then.
+async fn wait_for_session(
+    homeserver_url: &str,
+    access_token: &str,
+    mxid: &str,
+) -> anyhow::Result<()> {
+    let url = format!(
+        "{}/_matrix/client/v3/account/whoami",
+        homeserver_url.trim_end_matches('/')
+    );
+    let deadline = tokio::time::Instant::now() + BROKER_SESSION_TIMEOUT;
+    let http = reqwest::Client::new();
+    loop {
+        let resp = http
+            .get(&url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .with_context(|| format!("whoami request to {url} failed"))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if status != StatusCode::UNAUTHORIZED || tokio::time::Instant::now() >= deadline {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("homeserver did not accept the new session ({status}): {body}");
+        }
+        tracing::debug!("[{mxid}] Session not known to the homeserver yet, waiting …");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Revoke an OAuth 2.0 session (RFC 7009). The refresh token is revoked if
+/// there is one, which ends the whole session.
+async fn revoke_oauth_session(client: &Client, session: OAuthSession) -> anyhow::Result<()> {
+    let metadata = client.oauth().server_metadata().await?;
+    let tokens = session.user.tokens;
+    let (token, hint) = match tokens.refresh_token {
+        Some(refresh_token) => (refresh_token, "refresh_token"),
+        None => (tokens.access_token, "access_token"),
+    };
+    let url = metadata.revocation_endpoint;
+    let resp = reqwest::Client::new()
+        .post(url.clone())
+        .form(&[
+            ("token", token.as_str()),
+            ("token_type_hint", hint),
+            ("client_id", session.client_id.as_str()),
+        ])
+        .send()
+        .await
+        .with_context(|| format!("revocation request to {url} failed"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("revocation request to {url} failed ({status}): {body}");
+    }
+    Ok(())
+}
+
+/// Decode a successful JSON response, or fail with its status and body.
+async fn json_response<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+    url: &Url,
+) -> anyhow::Result<T> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("request to {url} failed ({status}): {body}");
+    }
+    resp.json()
+        .await
+        .with_context(|| format!("failed to decode response of {url}"))
+}
+
 // ── fuss ────────────────────────────────────────────────────────────────
 
 /// Successful response of fuss' `POST /v1/users/{user}/token` (only the
@@ -456,6 +724,23 @@ pub fn derive_secret(shared_secret: &str, mxid: &str) -> String {
         Hmac::<Sha1>::new_from_slice(shared_secret.as_bytes()).expect("HMAC accepts any key size");
     mac.update(mxid.as_bytes());
     base64_encode(mac.finalize().into_bytes())
+}
+
+/// Unpadded base64url, as OAuth 2.0 (PKCE) uses it.
+fn base64url_encode(input: impl AsRef<[u8]>) -> String {
+    base64_encode(input)
+        .trim_end_matches('=')
+        .replace('+', "-")
+        .replace('/', "_")
+}
+
+/// A random string of `len` characters from `A-Z0-9`, e.g. for device IDs.
+fn random_uppercase_alphanumeric(len: usize) -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::rng();
+    (0..len)
+        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+        .collect()
 }
 
 /// Derive a per-server STA secret from a seed and a hostname.
