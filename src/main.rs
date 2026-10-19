@@ -2,6 +2,7 @@ mod auth;
 mod datapoint;
 mod image;
 mod registration;
+mod runtime_config;
 mod telemetry;
 
 use std::{
@@ -163,7 +164,7 @@ impl FromStr for UserSpec {
 /// value uniformly at random from the range and returns it as a [`Duration`].
 ///
 /// Parsed from strings of the form `"10..20"` (range) or `"10"` (point).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IntervalRange {
     lo: u64,
     hi: u64,
@@ -334,9 +335,24 @@ struct Config {
     #[arg(long, env = "SYNC_ERROR_DELAY", default_value = "2")]
     sync_error_delay: IntervalRange,
 
-    /// Seconds between main-loop ticks.  Single value or range.
+    /// Seconds between main-loop ticks.  Single value or range.  Initial
+    /// value; can be changed at runtime via `DATAPOINT_HTTP`.
     #[arg(long, env = "LOOP_INTERVAL", default_value = "2")]
     loop_interval: IntervalRange,
+
+    /// Only the first `ACTIVE_USERS` entries of `USERS` send messages in the
+    /// main loop; all others still sync, receive, verify, accept invites and
+    /// create DMs.  Initial value; can be changed at runtime via
+    /// `DATAPOINT_HTTP`.
+    #[arg(long, env = "ACTIVE_USERS", default_value_t = u32::MAX)]
+    active_users: u32,
+
+    /// Base URL of the datapoint server's HTTP API (e.g.
+    /// `http://datapoint:8080`).  When set, `LOOP_INTERVAL` and
+    /// `ACTIVE_USERS` are updated from the latest value of its `Config`
+    /// type.
+    #[arg(long, env = "DATAPOINT_HTTP")]
+    datapoint_http: Option<String>,
 
     /// Number of main-loop cycles to wait before promoting to sender after
     /// becoming the first device.
@@ -858,10 +874,19 @@ async fn main() -> anyhow::Result<()> {
     // Cheap to clone and a no-op when `DATAPOINT_SERVER` is unset.
     let datapoint_client = datapoint::DatapointClient::from_env();
 
+    // ── Runtime configuration ───────────────────────────────────────────
+    let runtime_config = runtime_config::spawn(
+        config.datapoint_http.as_deref(),
+        runtime_config::RuntimeConfig {
+            loop_interval: config.loop_interval,
+            active_users: config.active_users,
+        },
+    );
+
     // ── Spawn one supervisor task per user (staggered) ──────────────────
     let mut handles = Vec::with_capacity(total_users);
     let mut stagger = Duration::ZERO;
-    for user in config.users.clone() {
+    for (user_index, user) in config.users.clone().into_iter().enumerate() {
         let user_stagger = stagger;
         stagger += config.login_interval.sample();
         let config = config.clone();
@@ -870,6 +895,7 @@ async fn main() -> anyhow::Result<()> {
         let ready_tx = ready_tx.clone();
         let restart_mutex = restart_mutex.clone();
         let datapoint_client = datapoint_client.clone();
+        let runtime_config = runtime_config.clone();
 
         let handle = tokio::spawn(async move {
             // ── Initial stagger ─────────────────────────────────────────
@@ -930,6 +956,8 @@ async fn main() -> anyhow::Result<()> {
                     total_users,
                     login_notify.clone(),
                     datapoint_client.clone(),
+                    user_index,
+                    runtime_config.clone(),
                 );
                 tokio::pin!(run_future);
 
@@ -1113,6 +1141,8 @@ async fn run_user(
     total_users: usize,
     login_notify: Arc<Notify>,
     datapoint_client: datapoint::DatapointClient,
+    user_index: usize,
+    runtime_config: watch::Receiver<runtime_config::RuntimeConfig>,
 ) -> RunUserOutcome {
     // RAII guard: when this function returns for *any* reason, decrement
     // the ready count (if it was incremented) and update the readiness
@@ -1624,6 +1654,9 @@ async fn run_user(
     .await;
     let mut promotion_counter: u64 = 0;
     let mut promoted = false;
+    // Whether this user is among the first `ACTIVE_USERS`; only changes are
+    // logged, so an inactive user is reported on the first tick.
+    let mut was_active = true;
     if we_are_first {
         tracing::info!(
             "[{mxid}] ✔ We are the first device – waiting {wait} cycle(s) before sending",
@@ -1776,9 +1809,19 @@ async fn run_user(
             .cloned()
             .collect();
 
-        // Find rooms eligible for sending (only if we are the first device
-        // and the promotion wait has elapsed).
-        let send_candidates: Vec<OwnedRoomId> = if we_are_first && promoted {
+        // Find rooms eligible for sending (only if we are the first device,
+        // the promotion wait has elapsed and we are among the first
+        // `ACTIVE_USERS` users).
+        let active = runtime_config.borrow().is_active(user_index);
+        if active != was_active {
+            if active {
+                tracing::info!("[{mxid}]   ▶ User is active – will send messages");
+            } else {
+                tracing::info!("[{mxid}]   ⏸ User is inactive – will not send messages");
+            }
+            was_active = active;
+        }
+        let send_candidates: Vec<OwnedRoomId> = if we_are_first && promoted && active {
             room_ids
                 .iter()
                 .filter(|id| rooms[*id].is_send_eligible())
@@ -1881,7 +1924,9 @@ async fn run_user(
             action_cycle = (action_cycle + 1) % 3;
         }
 
-        // Sleep for 2 seconds, but break early on shutdown or fatal sync.
+        // Sleep for the loop interval, but break early on shutdown or fatal
+        // sync.
+        let loop_interval = runtime_config.borrow().loop_interval.sample();
         let mut sync_fatal_watcher = sync_fatal_rx.clone();
         tokio::select! {
             _ = main_stop_rx.changed() => {
@@ -1900,7 +1945,7 @@ async fn run_user(
                     ));
                 }
             }
-            _ = sleep(config.loop_interval.sample()) => {}
+            _ = sleep(loop_interval) => {}
         }
     }
 
