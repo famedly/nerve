@@ -359,6 +359,12 @@ struct Config {
     #[arg(long, env = "PROMOTION_WAIT_CYCLES", default_value_t = 1)]
     promotion_wait_cycles: u64,
 
+    /// Disable the first-device election (promotion / demotion) in the main
+    /// loop and always behave as promoted, i.e. every device sends messages
+    /// and creates DMs.  `PROMOTION_WAIT_CYCLES` is ignored when set.
+    #[arg(long, env = "DISABLE_PROMOTION", default_value_t = false)]
+    disable_promotion: bool,
+
     /// Comma-separated domain patterns for auto-accepting room invites.
     #[arg(long, env = "ACCEPT_INVITE_DOMAINS", value_delimiter = ',')]
     accept_invite_domains: Vec<InviteDomainPattern>,
@@ -1645,19 +1651,24 @@ async fn run_user(
     // main-loop ticks before actually sending, so that other devices have a
     // chance to appear. `account_password` and `stale_device_timeout` were
     // computed during the E2EE setup above and are reused here.
-    let mut we_are_first = is_first_device(
-        &client,
-        stale_device_timeout,
-        account_password.as_deref(),
-        username,
-    )
-    .await;
+    // With `disable_promotion` the election is skipped entirely and we
+    // permanently behave as the promoted first device.
+    let mut we_are_first = config.disable_promotion
+        || is_first_device(
+            &client,
+            stale_device_timeout,
+            account_password.as_deref(),
+            username,
+        )
+        .await;
     let mut promotion_counter: u64 = 0;
-    let mut promoted = false;
+    let mut promoted = config.disable_promotion;
     // Whether this user is among the first `ACTIVE_USERS`; only changes are
     // logged, so an inactive user is reported on the first tick.
     let mut was_active = true;
-    if we_are_first {
+    if config.disable_promotion {
+        tracing::info!("[{mxid}] ✔ Promotion disabled – always sending");
+    } else if we_are_first {
         tracing::info!(
             "[{mxid}] ✔ We are the first device – waiting {wait} cycle(s) before sending",
             wait = config.promotion_wait_cycles
@@ -1728,13 +1739,15 @@ async fn run_user(
 
         // Re-check first-device status (handles other devices logging out).
         let was_first = we_are_first;
-        we_are_first = is_first_device(
-            &client,
-            stale_device_timeout,
-            account_password.as_deref(),
-            username,
-        )
-        .await;
+        if !config.disable_promotion {
+            we_are_first = is_first_device(
+                &client,
+                stale_device_timeout,
+                account_password.as_deref(),
+                username,
+            )
+            .await;
+        }
         if we_are_first && !was_first {
             // Just became the first device – start the promotion countdown.
             promotion_counter = 0;
